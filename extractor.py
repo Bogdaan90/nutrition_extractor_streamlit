@@ -1,23 +1,3 @@
-"""
-Nutrition Extractor (Image ➜ Text) — zero-infra Streamlit app
-
-Install deps:
-  pip install --upgrade streamlit openai pillow orjson
-
-Run locally:
-  set OPENAI_API_KEY=sk-...   # (Windows PowerShell: $env:OPENAI_API_KEY="sk-...")
-  streamlit run nutrition_extractor_streamlit.py
-
-Usage:
-  • Drag & drop up to ~500 images (jpg/png/webp)
-  • Click “Extract nutrition values”
-  • Download a single .txt file with clean, human-readable output
-
-Notes:
-  • Uses OpenAI Responses API with image inputs and Structured Outputs.
-  • No S3, no databases. Images are uploaded as temporary Files to the API, processed, then discarded.
-"""
-
 from __future__ import annotations
 import os, io, json, time, base64, textwrap
 from typing import Dict, Any, List
@@ -41,7 +21,7 @@ with st.sidebar:
     st.session_state["api_key"] = st.text_input(
         "OpenAI API key",
         type="password",
-        placeholder="sk-...",
+        placeholder="",
         help="Stored in session memory only; not written to disk."
     )
 
