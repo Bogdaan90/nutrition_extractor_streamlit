@@ -1,18 +1,22 @@
 from __future__ import annotations
-import os, io, json, time, base64, textwrap
+import io
+import os
+import json
+import time
+import base64
+import mimetypes
 from typing import Dict, Any, List
 
 import streamlit as st
-from PIL import Image
+from PIL import Image  
 from openai import OpenAI
 
-# --------------------------- UI SETUP ---------------------------
-st.set_page_config(page_title="Nutrition Extractor (Image ➜ Text)", layout="centered")
-st.title("Nutrition Extractor (Image ➜ Text)")
-st.caption("Drag & drop images of Nutrition Information Panels. Get clean text back.")
+# ============== PAGE SETUP ==============
+st.set_page_config(page_title="Nutrition Extractor (Image → Text)", layout="centered")
+st.title("Nutrition Extractor (Image → Text)")
+st.caption("Upload nutrition label images, extract values as plain text. No cloud infra required.")
 
-# --------------------------- AUTH VIA UI ---------------------------
-# Users enter their API key in the sidebar; stored only in session memory for this run.
+# ============== AUTH IN UI ==============
 if "api_key" not in st.session_state:
     st.session_state["api_key"] = ""
 
@@ -21,8 +25,8 @@ with st.sidebar:
     st.session_state["api_key"] = st.text_input(
         "OpenAI API key",
         type="password",
-        placeholder="",
-        help="Stored in session memory only; not written to disk."
+        placeholder="sk-...",
+        help="Stored only in this session; not written to disk."
     )
 
 api_key = st.session_state["api_key"]
@@ -30,11 +34,16 @@ if not api_key:
     st.info("Enter your OpenAI API key in the sidebar to enable extraction.")
     st.stop()
 
-# Create the client with the user-provided key
 client = OpenAI(api_key=api_key)
 
-# --------------------------- JSON SCHEMA ---------------------------
-# This schema is enforced via Structured Outputs so the model must return valid JSON.
+# Optional diagnostics
+try:
+    import sys, openai  # type: ignore
+    st.sidebar.caption(f"Diagnostics ▸ openai {openai.__version__} | python {sys.version.split()[0]}")
+except Exception:
+    pass
+
+# ============== JSON SCHEMA (STRICT) ==============
 SCHEMA: Dict[str, Any] = {
     "name": "NutritionPanel",
     "schema": {
@@ -134,77 +143,74 @@ SCHEMA: Dict[str, Any] = {
     "strict": True
 }
 
-# Tool definition (function calling) — use your JSON Schema as "parameters"
+# Tool (function) definition for strict structured output
 NUTRITION_TOOL = [{
     "type": "function",
     "function": {
         "name": "NutritionPanel",
         "description": "Extract nutrition panel values as strict JSON.",
-        "parameters": SCHEMA["schema"]  # the JSON Schema object you already have
+        "parameters": SCHEMA["schema"]  # pass the JSON Schema here
     }
 }]
-
 
 SYSTEM_PROMPT = (
     "You are an expert at reading EU/UK nutrition labels.\n"
     "- Read the nutrition information panel (NIP) from the image.\n"
     "- Report per 100g/ml and per serving if present.\n"
-    "- Return ONLY JSON per the schema. Numbers only, no units inside fields.\n"
-    "- If sodium is given, include sodium; if salt is shown, include salt as well.\n"
+    "- Return only JSON conforming to the function schema. Numbers only, no units in fields.\n"
+    "- If sodium is present, include sodium; if salt is shown, include salt as well.\n"
 )
 
-# --------------------------- HELPERS ---------------------------
-
+# ============== HELPERS ==============
 def infer_product_id(filename: str) -> str:
     stem = filename.rsplit("/", 1)[-1]
     stem = stem.rsplit(".", 1)[0]
     return stem or "unknown"
 
+def to_data_url(file_bytes: bytes, filename: str) -> str:
+    mime = mimetypes.guess_type(filename)[0] or "image/jpeg"
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
 
-def upload_image_to_openai(client: OpenAI, file_bytes: bytes, filename: str) -> str:
-    uploaded = client.files.create(file=(filename, io.BytesIO(file_bytes)), purpose="user_data")
-    return uploaded.id
-
-def extract_from_image_file(client: OpenAI, model_name: str, file_id: str, product_id: str) -> dict:
+def extract_from_image_bytes(client: OpenAI, model_name: str, img_bytes: bytes, filename: str, product_id: str) -> Dict[str, Any]:
+    """Responses API + tool calling. Image is passed as base64 data URL (no Files API)."""
+    data_url = to_data_url(img_bytes, filename)
     resp = client.responses.create(
-        model=model_name,
+        model=model_name,  # e.g., "gpt-4o"
         input=[{
             "role": "user",
             "content": [
                 {"type": "input_text", "text": SYSTEM_PROMPT + f"Product ID: {product_id}"},
-                {"type": "input_image", "image_file": {"file_id": file_id}}
+                {"type": "input_image", "image_url": data_url}
             ]
         }],
-        tools=[{
-            "type": "function",
-            "function": {
-                "name": "NutritionPanel",
-                "description": "Extract nutrition panel values as strict JSON.",
-                "parameters": SCHEMA["schema"]  # your JSON Schema object
-            }
-        }],
+        tools=NUTRITION_TOOL,
         tool_choice={"type": "function", "function": {"name": "NutritionPanel"}},
         temperature=0
     )
 
-    # Parse the tool call arguments (the structured JSON)
-    for item in resp.output:
-        for c in getattr(item, "content", []) or []:
-            if getattr(c, "type", "") in ("tool_call", "function_call"):
-                return json.loads(c.tool_call.function.arguments)
+    # Parse tool call arguments (strict JSON per schema)
+    # Typed path
+    try:
+        for item in resp.output:
+            for c in getattr(item, "content", []) or []:
+                if getattr(c, "type", "") in ("tool_call", "function_call"):
+                    return json.loads(c.tool_call.function.arguments)
+    except Exception:
+        pass
 
-    # Fallback if SDK returns raw dicts
+    # Raw dict path
     raw = getattr(resp, "model_dump", lambda: {})() or {}
     for item in raw.get("output", []):
         for c in item.get("content", []):
             if c.get("type") in ("tool_call", "function_call"):
                 return json.loads(c["tool_call"]["function"]["arguments"])
 
-    # Last resort (shouldn’t trigger with tool_choice forced)
-    return json.loads(getattr(resp, "output_text", "{}"))
+    # Last resort (shouldn't trigger with tool_choice forced)
+    text = getattr(resp, "output_text", "") or "{}"
+    return json.loads(text)
 
 def as_human_text(p: Dict[str, Any]) -> str:
-    """Format one extraction block into readable text."""
     b = p.get("basis", {})
     e = p.get("energy", {})
     fat = p.get("fat", {})
@@ -212,27 +218,31 @@ def as_human_text(p: Dict[str, Any]) -> str:
     fib = p.get("fibre", {})
     pro = p.get("protein", {})
     salt = p.get("salt", {})
+    rp = p.get("ri_percent", {})
 
     lines = [
         f"Product_ID: {p.get('product_id','')}",
         f"Panel_Detected: {p.get('panel_detected', False)}",
         f"Basis: per_100g={b.get('per_100g')}, per_serving={b.get('per_serving')}, serving_size={b.get('serving_size')}",
-        f"Per_100g: Energy {e.get('kJ_100')} kJ / {e.get('kcal_100')} kcal; "
-        f"Fat {fat.get('g_100')} g (sat {fat.get('saturates_g_100')} g); "
-        f"Carb {carb.get('g_100')} g (sugars {carb.get('sugars_g_100')} g); "
-        f"Fibre {fib.get('g_100')}; Protein {pro.get('g_100')} g; Salt {salt.get('g_100')} g",
+        (
+            "Per_100g: "
+            f"Energy {e.get('kJ_100')} kJ / {e.get('kcal_100')} kcal; "
+            f"Fat {fat.get('g_100')} g (sat {fat.get('saturates_g_100')} g); "
+            f"Carb {carb.get('g_100')} g (sugars {carb.get('sugars_g_100')} g); "
+            f"Fibre {fib.get('g_100')}; Protein {pro.get('g_100')} g; Salt {salt.get('g_100')} g"
+        ),
     ]
 
-    if (e.get("kcal_serv") is not None) or (fat.get("g_serv") is not None):
+    if (e.get("kcal_serv") is not None) or (fat.get("g_serv") is not None) or (carb.get("g_serv") is not None) or (pro.get("g_serv") is not None) or (salt.get("g_serv") is not None):
         lines.append(
-            f"Per_Serving: Energy {e.get('kJ_serv')} kJ / {e.get('kcal_serv')} kcal; "
+            "Per_Serving: "
+            f"Energy {e.get('kJ_serv')} kJ / {e.get('kcal_serv')} kcal; "
             f"Fat {fat.get('g_serv')} g (sat {fat.get('saturates_g_serv')} g); "
             f"Carb {carb.get('g_serv')} g (sugars {carb.get('sugars_g_serv')} g); "
             f"Fibre {fib.get('g_serv')}; Protein {pro.get('g_serv')} g; Salt {salt.get('g_serv')} g"
         )
 
-    rp = p.get("ri_percent", {})
-    if any(v is not None for v in rp.values()):
+    if any(v is not None for v in rp.values()) if isinstance(rp, dict) else False:
         lines.append(
             "RI_Percent: "
             f"kcal={rp.get('kcal_serv')}%, fat={rp.get('fat')}%, sat={rp.get('saturates')}%, "
@@ -244,15 +254,13 @@ def as_human_text(p: Dict[str, Any]) -> str:
 
     return "\n".join(lines)
 
-
-# --------------------------- APP BODY ---------------------------
+# ============== SIDEBAR SETTINGS ==============
 with st.sidebar:
     st.subheader("Settings")
     model = st.selectbox("Model", options=["gpt-4o"], index=0, help="Vision-capable model for extraction.")
     max_items = st.number_input("Max images to process", min_value=1, max_value=500, value=500, step=1)
-    st.markdown("---")
-    st.caption("Images are uploaded as temporary files to the API for processing.")
 
+# ============== MAIN UI ==============
 uploads = st.file_uploader(
     "Upload nutrition label images (JPG/PNG/WEBP)",
     type=["jpg", "jpeg", "png", "webp"],
@@ -261,33 +269,31 @@ uploads = st.file_uploader(
 )
 
 if uploads:
-    st.write(f"Selected **{len(uploads)}** file(s). Filenames will be used as product IDs.")
+    st.write(f"Selected **{len(uploads)}** file(s). Filenames will be used as Product IDs.")
 
 run = st.button("Extract nutrition values", type="primary", use_container_width=True)
 
 if run:
     if not uploads:
         st.stop()
+
     outputs: List[str] = []
+    total = min(len(uploads), max_items)
     progress = st.progress(0.0, text="Starting…")
 
-    for idx, up in enumerate(uploads[:max_items], start=1):
-	    filename = up.name
-	    product_id = infer_product_id(filename)
-	    try:
-	        img_bytes = up.read()
-	        file_id = upload_image_to_openai(client, img_bytes, filename)
-	        payload = extract_from_image_file(client, model, file_id, product_id)
-	        payload["source_image"] = filename
-	        outputs.append(as_human_text(payload) + "\n---\n")
-	    except Exception as e:
-	        outputs.append(f"Product_ID: {product_id}\nERROR: {e}\n---\n")
-	    finally:
-	        progress.progress(
-	            idx / max(1, min(len(uploads), max_items)),
-	            text=f"Processed {idx} / {min(len(uploads), max_items)}"
-	        )
-
+    for idx, up in enumerate(uploads[:total], start=1):
+        filename = up.name
+        product_id = infer_product_id(filename)
+        try:
+            img_bytes = up.read()
+            payload = extract_from_image_bytes(client, model, img_bytes, filename, product_id)
+            payload["source_image"] = filename
+            outputs.append(as_human_text(payload) + "\n---\n")
+        except Exception as e:
+            outputs.append(f"Product_ID: {product_id}\nERROR: {e}\n---\n")
+        finally:
+            progress.progress(idx / max(1, total), text=f"Processed {idx} / {total}")
+            time.sleep(0.05)
 
     final_text = "\n".join(outputs).strip()
     st.success("Completed.")
@@ -301,4 +307,4 @@ if run:
         use_container_width=True,
     )
 
-    st.caption("Tip: Keep images sharp and square-on for best results.")
+    st.caption("Tip: keep images sharp and square-on for best results.")
