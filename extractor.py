@@ -188,7 +188,7 @@ def extract_from_image_bytes(client: OpenAI, model_name: str, img_bytes: bytes, 
 )
 
     # Parse tool call arguments (strict JSON per schema)
-    # typed path first
+    # Typed path
 	try:
 	    for item in resp.output:
 	        for c in getattr(item, "content", []) or []:
@@ -199,9 +199,9 @@ def extract_from_image_bytes(client: OpenAI, model_name: str, img_bytes: bytes, 
 	                return json.loads(args)
 	except Exception:
 	    pass
-	
-	# raw dict fallback
-	raw = getattr(resp, "model_dump", lambda: {})() or {}
+
+    # Raw dict path
+    raw = getattr(resp, "model_dump", lambda: {})() or {}
 	for item in raw.get("output", []):
 	    for c in item.get("content", []):
 	        if c.get("type") in ("tool_call", "function_call"):
@@ -212,7 +212,6 @@ def extract_from_image_bytes(client: OpenAI, model_name: str, img_bytes: bytes, 
 	
 	# last resort (shouldn’t trigger with tool_choice forced)
 	return json.loads(getattr(resp, "output_text", "{}"))
-
 
 def as_human_text(p: Dict[str, Any]) -> str:
     b = p.get("basis", {})
