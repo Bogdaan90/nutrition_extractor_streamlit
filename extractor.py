@@ -146,11 +146,9 @@ SCHEMA: Dict[str, Any] = {
 # Tool (function) definition for strict structured output
 NUTRITION_TOOL = [{
     "type": "function",
-    "function": {
-        "name": "NutritionPanel",
-        "description": "Extract nutrition panel values as strict JSON.",
-        "parameters": SCHEMA["schema"]  # pass the JSON Schema here
-    }
+    "name": "NutritionPanel",
+    "description": "Extract nutrition panel values as strict JSON.",
+    "parameters": SCHEMA["schema"]   # reuse your existing JSON Schema object
 }]
 
 SYSTEM_PROMPT = (
@@ -176,18 +174,18 @@ def extract_from_image_bytes(client: OpenAI, model_name: str, img_bytes: bytes, 
     """Responses API + tool calling. Image is passed as base64 data URL (no Files API)."""
     data_url = to_data_url(img_bytes, filename)
     resp = client.responses.create(
-        model=model_name,  # e.g., "gpt-4o"
-        input=[{
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": SYSTEM_PROMPT + f"Product ID: {product_id}"},
-                {"type": "input_image", "image_url": data_url}
-            ]
-        }],
-        tools=NUTRITION_TOOL,
-        tool_choice={"type": "function", "function": {"name": "NutritionPanel"}},
-        temperature=0
-    )
+	    model=model_name,  # e.g., "gpt-4o"
+	    input=[{
+	        "role": "user",
+	        "content": [
+	            {"type": "input_text", "text": SYSTEM_PROMPT + f"Product ID: {product_id}"},
+	            {"type": "input_image", "image_url": to_data_url(img_bytes, filename)}
+	        ]
+	    }],
+	    tools=NUTRITION_TOOL,
+	    tool_choice={"type": "function", "name": "NutritionPanel"},
+	    temperature=0
+)
 
     # Parse tool call arguments (strict JSON per schema)
     # Typed path
