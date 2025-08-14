@@ -188,25 +188,31 @@ def extract_from_image_bytes(client: OpenAI, model_name: str, img_bytes: bytes, 
 )
 
     # Parse tool call arguments (strict JSON per schema)
-    # Typed path
-    try:
-        for item in resp.output:
-            for c in getattr(item, "content", []) or []:
-                if getattr(c, "type", "") in ("tool_call", "function_call"):
-                    return json.loads(c.tool_call.function.arguments)
-    except Exception:
-        pass
+    # typed path first
+	try:
+	    for item in resp.output:
+	        for c in getattr(item, "content", []) or []:
+	            if getattr(c, "type", "") in ("tool_call", "function_call"):
+	                # Some SDKs expose .tool_call.function.arguments; others expose .tool_call.arguments
+	                tc = c.tool_call
+	                args = getattr(getattr(tc, "function", None), "arguments", None) or getattr(tc, "arguments", None)
+	                return json.loads(args)
+	except Exception:
+	    pass
+	
+	# raw dict fallback
+	raw = getattr(resp, "model_dump", lambda: {})() or {}
+	for item in raw.get("output", []):
+	    for c in item.get("content", []):
+	        if c.get("type") in ("tool_call", "function_call"):
+	            f = c.get("tool_call", {}).get("function", {})
+	            args = f.get("arguments") or c.get("tool_call", {}).get("arguments")
+	            if args:
+	                return json.loads(args)
+	
+	# last resort (shouldn’t trigger with tool_choice forced)
+	return json.loads(getattr(resp, "output_text", "{}"))
 
-    # Raw dict path
-    raw = getattr(resp, "model_dump", lambda: {})() or {}
-    for item in raw.get("output", []):
-        for c in item.get("content", []):
-            if c.get("type") in ("tool_call", "function_call"):
-                return json.loads(c["tool_call"]["function"]["arguments"])
-
-    # Last resort (shouldn't trigger with tool_choice forced)
-    text = getattr(resp, "output_text", "") or "{}"
-    return json.loads(text)
 
 def as_human_text(p: Dict[str, Any]) -> str:
     b = p.get("basis", {})
