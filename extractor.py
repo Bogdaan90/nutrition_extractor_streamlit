@@ -31,11 +31,27 @@ st.set_page_config(page_title="Nutrition Extractor (Image ➜ Text)", layout="ce
 st.title("Nutrition Extractor (Image ➜ Text)")
 st.caption("Drag & drop images of Nutrition Information Panels. Get clean text back.")
 
-# API key gate
-if not os.getenv("OPENAI_API_KEY"):
-    st.warning("Set the OPENAI_API_KEY environment variable before running.")
+# --------------------------- AUTH VIA UI ---------------------------
+# Users enter their API key in the sidebar; stored only in session memory for this run.
+if "api_key" not in st.session_state:
+    st.session_state["api_key"] = ""
 
-client = OpenAI()
+with st.sidebar:
+    st.subheader("Authentication")
+    st.session_state["api_key"] = st.text_input(
+        "OpenAI API key",
+        type="password",
+        placeholder="sk-...",
+        help="Stored in session memory only; not written to disk."
+    )
+
+api_key = st.session_state["api_key"]
+if not api_key:
+    st.info("Enter your OpenAI API key in the sidebar to enable extraction.")
+    st.stop()
+
+# Create the client with the user-provided key
+client = OpenAI(api_key=api_key)
 
 # --------------------------- JSON SCHEMA ---------------------------
 # This schema is enforced via Structured Outputs so the model must return valid JSON.
