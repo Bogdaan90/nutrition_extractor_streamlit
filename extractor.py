@@ -134,6 +134,17 @@ SCHEMA: Dict[str, Any] = {
     "strict": True
 }
 
+# Tool definition (function calling) — use your JSON Schema as "parameters"
+NUTRITION_TOOL = [{
+    "type": "function",
+    "function": {
+        "name": "NutritionPanel",
+        "description": "Extract nutrition panel values as strict JSON.",
+        "parameters": SCHEMA["schema"]  # the JSON Schema object you already have
+    }
+}]
+
+
 SYSTEM_PROMPT = (
     "You are an expert at reading EU/UK nutrition labels.\n"
     "- Read the nutrition information panel (NIP) from the image.\n"
@@ -158,35 +169,55 @@ def upload_image_to_openai(file_bytes: bytes, filename: str) -> str:
     return uploaded.id
 
 
-def extract_from_image_file(file_id: str, product_id: str) -> Dict[str, Any]:
-    """Call Responses API with image file id and JSON schema."""
-    response = client.responses.create(
-        model="gpt-4o",  # Vision-capable, supports Structured Outputs
+def extract_from_image_file(client, model_name: str, file_id: str, product_id: str):
+    resp = client.responses.create(
+        model=model_name,                # e.g., "gpt-4o"
         input=[{
             "role": "user",
             "content": [
-                {"type": "input_text", "text": SYSTEM_PROMPT + f"Product ID: {product_id}"},
-                {"type": "input_image", "image_file": {"file_id": file_id}}
+                {"type": "input_text",
+                 "text": SYSTEM_PROMPT + f"Product ID: {product_id}"},
+                {"type": "input_image",
+                 "image_file": {"file_id": file_id}}
             ]
         }],
-        response_format={"type": "json_schema", "json_schema": SCHEMA}
+        tools=NUTRITION_TOOL,
+        # Force the model to call our function (no free-form prose)
+        tool_choice={"type": "function", "function": {"name": "NutritionPanel"}},
+        temperature=0
     )
 
-    # Try robust parsing of the JSON payload from Responses API output
-    data_text = None
+    # --- Parse tool call arguments robustly ---
+    # SDKs return typed objects; fall back to dict if needed.
     try:
-        data_text = response.output[0].content[0].text  # primary path
+        # Happy path: walk typed structure
+        for item in resp.output:
+            if not getattr(item, "content", None):
+                continue
+            for c in item.content:
+                if getattr(c, "type", "") in ("tool_call", "function_call"):
+                    args = c.tool_call.function.arguments  # stringified JSON
+                    return json.loads(args)
     except Exception:
-        try:
-            data_text = response.output_text  # convenience property
-        except Exception as e:
-            raise RuntimeError(f"Unexpected response format: {e}")
+        pass
 
-    try:
-        data = json.loads(data_text)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"Model did not return valid JSON: {e}\nRaw: {data_text[:400]}")
-    return data
+    # Fallback: dump to dict and traverse keys
+    raw = getattr(resp, "model_dump", lambda: {})()
+    if not raw:
+        raw = json.loads(getattr(resp, "json", "{}")) if hasattr(resp, "json") else {}
+
+    # Common raw shapes: output -> [ { content: [ { type: "tool_call", tool_call:{function:{arguments:"..."}} } ] } ]
+    outputs = raw.get("output", [])
+    for item in outputs:
+        for c in item.get("content", []):
+            if c.get("type") in ("tool_call", "function_call"):
+                return json.loads(c["tool_call"]["function"]["arguments"])
+
+    # If for some reason the model didn’t call the tool (shouldn’t happen with tool_choice forced),
+    # last resort: try to parse any text output as JSON
+    text = getattr(resp, "output_text", "") or ""
+    return json.loads(text)
+
 
 
 def as_human_text(p: Dict[str, Any]) -> str:
