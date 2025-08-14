@@ -161,64 +161,47 @@ def infer_product_id(filename: str) -> str:
     return stem or "unknown"
 
 
-def upload_image_to_openai(file_bytes: bytes, filename: str) -> str:
-    """Upload image to OpenAI Files API and return file_id."""
-    # Streamlit's UploadedFile is file-like; convert to BytesIO
-    bio = io.BytesIO(file_bytes)
-    uploaded = client.files.create(file=(filename, bio), purpose="user_data")
+def upload_image_to_openai(client: OpenAI, file_bytes: bytes, filename: str) -> str:
+    uploaded = client.files.create(file=(filename, io.BytesIO(file_bytes)), purpose="user_data")
     return uploaded.id
 
-
-def extract_from_image_file(client, model_name: str, file_id: str, product_id: str):
+def extract_from_image_file(client: OpenAI, model_name: str, file_id: str, product_id: str) -> dict:
     resp = client.responses.create(
-        model=model_name,                # e.g., "gpt-4o"
+        model=model_name,
         input=[{
             "role": "user",
             "content": [
-                {"type": "input_text",
-                 "text": SYSTEM_PROMPT + f"Product ID: {product_id}"},
-                {"type": "input_image",
-                 "image_file": {"file_id": file_id}}
+                {"type": "input_text", "text": SYSTEM_PROMPT + f"Product ID: {product_id}"},
+                {"type": "input_image", "image_file": {"file_id": file_id}}
             ]
         }],
-        tools=NUTRITION_TOOL,
-        # Force the model to call our function (no free-form prose)
+        tools=[{
+            "type": "function",
+            "function": {
+                "name": "NutritionPanel",
+                "description": "Extract nutrition panel values as strict JSON.",
+                "parameters": SCHEMA["schema"]  # your JSON Schema object
+            }
+        }],
         tool_choice={"type": "function", "function": {"name": "NutritionPanel"}},
         temperature=0
     )
 
-    # --- Parse tool call arguments robustly ---
-    # SDKs return typed objects; fall back to dict if needed.
-    try:
-        # Happy path: walk typed structure
-        for item in resp.output:
-            if not getattr(item, "content", None):
-                continue
-            for c in item.content:
-                if getattr(c, "type", "") in ("tool_call", "function_call"):
-                    args = c.tool_call.function.arguments  # stringified JSON
-                    return json.loads(args)
-    except Exception:
-        pass
+    # Parse the tool call arguments (the structured JSON)
+    for item in resp.output:
+        for c in getattr(item, "content", []) or []:
+            if getattr(c, "type", "") in ("tool_call", "function_call"):
+                return json.loads(c.tool_call.function.arguments)
 
-    # Fallback: dump to dict and traverse keys
-    raw = getattr(resp, "model_dump", lambda: {})()
-    if not raw:
-        raw = json.loads(getattr(resp, "json", "{}")) if hasattr(resp, "json") else {}
-
-    # Common raw shapes: output -> [ { content: [ { type: "tool_call", tool_call:{function:{arguments:"..."}} } ] } ]
-    outputs = raw.get("output", [])
-    for item in outputs:
+    # Fallback if SDK returns raw dicts
+    raw = getattr(resp, "model_dump", lambda: {})() or {}
+    for item in raw.get("output", []):
         for c in item.get("content", []):
             if c.get("type") in ("tool_call", "function_call"):
                 return json.loads(c["tool_call"]["function"]["arguments"])
 
-    # If for some reason the model didn’t call the tool (shouldn’t happen with tool_choice forced),
-    # last resort: try to parse any text output as JSON
-    text = getattr(resp, "output_text", "") or ""
-    return json.loads(text)
-
-
+    # Last resort (shouldn’t trigger with tool_choice forced)
+    return json.loads(getattr(resp, "output_text", "{}"))
 
 def as_human_text(p: Dict[str, Any]) -> str:
     """Format one extraction block into readable text."""
