@@ -272,22 +272,22 @@ if run:
     progress = st.progress(0.0, text="Starting…")
 
     for idx, up in enumerate(uploads[:max_items], start=1):
-        filename = up.name
-        product_id = infer_product_id(filename)
-        try:
-            # 1) upload each image to OpenAI file storage
-            img_bytes = up.read()
-			file_id = upload_image_to_openai(client, img_bytes, filename)
-            # 2) extract via Responses API (Structured Outputs)
-            payload = extract_from_image_file(client, model, file_id, product_id)
-            payload["source_image"] = filename
-            # 3) render as human-readable text block
-            outputs.append(as_human_text(payload) + "\n---\n")
-        except Exception as e:
-            outputs.append(f"Product_ID: {product_id}\nERROR: {e}\n---\n")
-        finally:
-            progress.progress(idx / max(1, min(len(uploads), max_items)), text=f"Processed {idx} / {min(len(uploads), max_items)}")
-            time.sleep(0.05)
+    filename = up.name
+    product_id = infer_product_id(filename)
+    try:
+        img_bytes = up.read()
+        file_id = upload_image_to_openai(client, img_bytes, filename)
+        payload = extract_from_image_file(client, model, file_id, product_id)
+        payload["source_image"] = filename
+        outputs.append(as_human_text(payload) + "\n---\n")
+    except Exception as e:
+        outputs.append(f"Product_ID: {product_id}\nERROR: {e}\n---\n")
+    finally:
+        progress.progress(
+            idx / max(1, min(len(uploads), max_items)),
+            text=f"Processed {idx} / {min(len(uploads), max_items)}"
+        )
+
 
     final_text = "\n".join(outputs).strip()
     st.success("Completed.")
