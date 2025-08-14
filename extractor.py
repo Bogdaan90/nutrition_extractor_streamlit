@@ -275,9 +275,11 @@ if run:
         filename = up.name
         product_id = infer_product_id(filename)
         try:
-			img_bytes = up.read()
+            # 1) upload each image to OpenAI file storage
+            img_bytes = up.read()
 			file_id = upload_image_to_openai(client, img_bytes, filename)
-			payload = extract_from_image_file(client, model, file_id, product_id)
+            # 2) extract via Responses API (Structured Outputs)
+            payload = extract_from_image_file(client, model, file_id, product_id)
             payload["source_image"] = filename
             # 3) render as human-readable text block
             outputs.append(as_human_text(payload) + "\n---\n")
