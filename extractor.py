@@ -1,6 +1,5 @@
 from __future__ import annotations
 import io
-import os
 import json
 import time
 import base64
@@ -8,13 +7,13 @@ import mimetypes
 from typing import Dict, Any, List
 
 import streamlit as st
-from PIL import Image, ImageOps  # Pillow for optional orientation fixes
+from PIL import Image, ImageOps
 from openai import OpenAI
 
 # ============== PAGE SETUP ==============
 st.set_page_config(page_title="Nutrition Extractor (Image → Text)", layout="centered")
 st.title("Nutrition Extractor (Image → Text)")
-st.caption("Upload nutrition labels, get JSON back — no schema, just valid JSON.")
+st.caption("Upload nutrition labels, get JSON back — schema-less, robust, no response_format parameter.")
 
 # ============== AUTH IN UI ==============
 if "api_key" not in st.session_state:
@@ -57,19 +56,33 @@ def to_data_url(file_bytes: bytes, filename: str) -> str:
     b64 = base64.b64encode(file_bytes).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
+# Instruction for schema-less JSON
 INSTRUCTION = (
     "Extract all nutrition and related values you can read from this label into a single JSON object.\n"
     "- Include per-100g/ml and per-serving if present.\n"
     "- Use numbers for numeric fields (no units inside numbers).\n"
     "- If an item is not printed on the label, omit it (do not guess).\n"
     "- Include a top-level 'product_id' with the provided value.\n"
-    "- Examples of useful keys (use only if they appear): energy_kJ_100, energy_kcal_100, energy_kJ_serv, energy_kcal_serv, "
-    "fat_g_100, saturates_g_100, fat_g_serv, saturates_g_serv, carbohydrate_g_100, sugars_g_100, carbohydrate_g_serv, sugars_g_serv, "
-    "fibre_g_100, fibre_g_serv, protein_g_100, protein_g_serv, salt_g_100, salt_g_serv, sodium_g_100, sodium_g_serv, "
-    "alcohol_g_100, alcohol_g_serv, vitamins:{...}, minerals:{...}, amino_acids:[...], probiotics:[...], botanicals:[...], "
+    "- Examples of helpful keys (use only if printed): "
+    "energy_kJ_100, energy_kcal_100, energy_kJ_serv, energy_kcal_serv, "
+    "fat_g_100, saturates_g_100, fat_g_serv, saturates_g_serv, carbohydrate_g_100, sugars_g_100, "
+    "carbohydrate_g_serv, sugars_g_serv, fibre_g_100, fibre_g_serv, protein_g_100, protein_g_serv, "
+    "salt_g_100, salt_g_serv, sodium_g_100, sodium_g_serv, alcohol_g_100, alcohol_g_serv, "
+    "vitamins:{...}, minerals:{...}, amino_acids:[...], probiotics:[...], botanicals:[...], "
     "other_nutrients:[...], ingredients_text, allergens_present, may_contain, sweeteners_present.\n"
-    "- Return JSON only, no prose."
+    "- Return JSON only via the function call (no prose)."
 )
+
+# Minimal tool (function) to force a JSON object back (schema-less but structured)
+NUTRITION_TOOL_MINIMAL = [{
+    "type": "function",
+    "name": "NutritionDump",
+    "description": "Return any nutrition facts found as a single JSON object.",
+    "parameters": {  # ultra-light schema: any keys allowed
+        "type": "object",
+        "additionalProperties": True
+    }
+}]
 
 def extract_from_image_bytes_noschema(
     client: OpenAI,
@@ -79,19 +92,17 @@ def extract_from_image_bytes_noschema(
     product_id: str
 ) -> Dict[str, Any]:
     """
-    Responses API (no explicit schema): request valid JSON via response_format={"type":"json_object"}.
+    Responses API (no response_format). We force a function/tool call that returns a JSON object.
     Image is sent inline as a base64 data URL. Returns a Python dict.
     """
-    # Normalize orientation; keep size as-is (you can resize if you want to limit payload)
+    # Normalize orientation; re-encode to JPEG to keep payload efficient
     try:
         img = Image.open(io.BytesIO(img_bytes))
         img = ImageOps.exif_transpose(img)
         buf = io.BytesIO()
-        # Save as JPEG to keep payload efficient even if user uploaded PNG
         img.convert("RGB").save(buf, format="JPEG", quality=90, optimize=True)
         img_bytes = buf.getvalue()
     except Exception:
-        # If Pillow fails, fall back to original bytes
         pass
 
     data_url = to_data_url(img_bytes, filename)
@@ -107,24 +118,58 @@ def extract_from_image_bytes_noschema(
                  "image_url": data_url}
             ]
         }],
-        response_format={"type": "json_object"},
+        tools=NUTRITION_TOOL_MINIMAL,
+        tool_choice={"type": "function", "name": "NutritionDump"},
         temperature=0
     )
 
-    # The SDK exposes a convenience: output_text (single string)
-    txt = getattr(resp, "output_text", "") or ""
-    if not txt:
-        # Fallback to raw output traversal if needed
-        raw = getattr(resp, "model_dump", lambda: {})() or {}
-        txt = raw.get("output_text", "{}") or "{}"
-
+    # ---- Parse the tool call arguments into a dict ----
+    # Preferred typed-object path
     try:
-        data = json.loads(txt)
+        for item in getattr(resp, "output", []) or []:
+            for c in getattr(item, "content", []) or []:
+                if getattr(c, "type", "") in ("tool_call", "function_call"):
+                    tc = getattr(c, "tool_call", None)
+                    if tc is not None:
+                        func = getattr(tc, "function", None)
+                        args = (getattr(func, "arguments", None)
+                                if func is not None else None) or getattr(tc, "arguments", None)
+                        if args:
+                            data = json.loads(args)
+                            data.setdefault("product_id", product_id)
+                            return data
     except Exception:
-        # As a last resort, wrap raw text
-        data = {"product_id": product_id, "raw": txt}
+        pass
 
-    # Ensure product_id present
+    # Raw-dict fallback
+    raw = {}
+    if hasattr(resp, "model_dump"):
+        try:
+            raw = resp.model_dump() or {}
+        except Exception:
+            raw = {}
+    if not raw and hasattr(resp, "json"):
+        try:
+            raw = json.loads(resp.json())
+        except Exception:
+            raw = {}
+
+    for item in raw.get("output", []) or []:
+        for c in item.get("content", []) or []:
+            if c.get("type") in ("tool_call", "function_call"):
+                tc = c.get("tool_call", {}) or {}
+                args = tc.get("function", {}).get("arguments") or tc.get("arguments")
+                if args:
+                    data = json.loads(args)
+                    data.setdefault("product_id", product_id)
+                    return data
+
+    # Last resort: wrap any text we got (shouldn’t trigger with tool_choice forced)
+    text = getattr(resp, "output_text", "") or raw.get("output_text", "") or "{}"
+    try:
+        data = json.loads(text)
+    except Exception:
+        data = {"raw": text}
     data.setdefault("product_id", product_id)
     return data
 
