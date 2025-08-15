@@ -78,7 +78,61 @@ def infer_product_id(filename: str) -> str:
     stem = filename.rsplit("/", 1)[-1]
     stem = stem.rsplit(".", 1)[0]
     return stem or "unknown"
+	
+def infer_unit_from_key(key: str) -> str | None:
+    """Best-effort unit guess when the model didn't return a units map."""
+    k = key.lower()
+    # energy
+    if "kj" in k: return "kJ"
+    if "kcal" in k: return "kcal"
+    # percent/RI
+    if "ri" in k or k.endswith("_percent") or k.endswith("_pct"): return "%"
+    # grams / milligrams / micrograms
+    # Look for common suffix patterns: *_g_100, *_g_serv, *_mg_100, *_ug_serv, etc.
+    import re
+    m = re.search(r"_(g|mg|µg|ug)_(100|serv|ml|portion)$", k)
+    if m:
+        unit, basis = m.groups()
+        unit = "µg" if unit == "ug" else unit
+        if basis == "100": 
+            return f"{unit}/100g"
+        if basis in ("serv", "portion"):
+            return f"{unit}/serving"
+        if basis == "ml":
+            return f"{unit}/100ml"
+    # Simple “_g” or “_mg” without basis
+    if k.endswith("_g"): return "g"
+    if k.endswith("_mg"): return "mg"
+    if k.endswith("_ug") or k.endswith("_µg"): return "µg"
+    # probiotics commonly as CFU
+    if "cfu" in k: return "CFU"
+    return None
 
+
+def merge_units_into_flat(flat: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Add <key>_unit columns to a flattened record.
+    Priority 1: payload['units'][key]
+    Priority 2: infer from key name
+    """
+    out = dict(flat)
+    units_map = payload.get("units")
+    units_map = units_map if isinstance(units_map, dict) else {}
+
+    for k in list(flat.keys()):
+        # If key already has a unit column, skip
+        unit_col = f"{k}_unit"
+        if unit_col in out:
+            continue
+        # 1) model-supplied units
+        if k in units_map and isinstance(units_map[k], str) and units_map[k].strip():
+            out[unit_col] = units_map[k].strip()
+            continue
+        # 2) heuristic inference
+        inferred = infer_unit_from_key(k)
+        if inferred:
+            out[unit_col] = inferred
+    return out
 
 def to_data_url(file_bytes: bytes, filename: str) -> str:
     """Convert image bytes to a base64 data URL to send inline to the Responses API."""
@@ -116,8 +170,11 @@ INSTRUCTION = (
     "- Use numbers for numeric fields (no units inside numbers).\n"
     "- If an item is not printed on the label, omit it (do not guess).\n"
     "- Include a top-level 'product_id' with the provided value.\n"
+    "- ALSO include a top-level 'units' object mapping each numeric key you return to its unit string "
+    "(e.g., 'energy_kJ_100'→'kJ', 'fat_g_100'→'g', 'sodium_g_serv'→'g', 'Vitamin C.per_serv'→'mg').\n"
     "- Return JSON only (no prose, no markdown)."
 )
+
 
 
 def extract_from_image_bytes_freeform(
