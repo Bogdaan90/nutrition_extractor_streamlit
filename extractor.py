@@ -78,11 +78,13 @@ NUTRITION_TOOL_MINIMAL = [{
     "type": "function",
     "name": "NutritionDump",
     "description": "Return any nutrition facts found as a single JSON object.",
-    "parameters": {  # ultra-light schema: any keys allowed
+    "parameters": {
         "type": "object",
-        "additionalProperties": True
+        "properties": {},               # <-- REQUIRED, even if empty
+        "additionalProperties": True    # allow any keys/shape
     }
 }]
+
 
 def extract_from_image_bytes_noschema(
     client: OpenAI,
