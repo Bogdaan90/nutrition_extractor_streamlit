@@ -8,13 +8,13 @@ import mimetypes
 from typing import Dict, Any, List
 
 import streamlit as st
-from PIL import Image  
+from PIL import Image, ImageOps  # Pillow for optional orientation fixes
 from openai import OpenAI
 
 # ============== PAGE SETUP ==============
 st.set_page_config(page_title="Nutrition Extractor (Image → Text)", layout="centered")
 st.title("Nutrition Extractor (Image → Text)")
-st.caption("Upload nutrition label images, extract values as plain text. No cloud infra required.")
+st.caption("Upload nutrition labels, get JSON back — no schema, just valid JSON.")
 
 # ============== AUTH IN UI ==============
 if "api_key" not in st.session_state:
@@ -43,122 +43,6 @@ try:
 except Exception:
     pass
 
-# ============== JSON SCHEMA (STRICT) ==============
-SCHEMA: Dict[str, Any] = {
-    "name": "NutritionPanel",
-    "schema": {
-        "type": "object",
-        "properties": {
-            "product_id": {"type": "string"},
-            "panel_detected": {"type": "boolean"},
-            "basis": {
-                "type": "object",
-                "properties": {
-                    "per_100g": {"type": "boolean"},
-                    "per_serving": {"type": "boolean"},
-                    "serving_size": {"type": ["string", "null"]}
-                },
-                "required": ["per_100g", "per_serving", "serving_size"]
-            },
-            "energy": {
-                "type": "object",
-                "properties": {
-                    "kJ_100": {"type": "number"},
-                    "kcal_100": {"type": "number"},
-                    "kJ_serv": {"type": ["number", "null"]},
-                    "kcal_serv": {"type": ["number", "null"]}
-                },
-                "required": ["kJ_100", "kcal_100", "kJ_serv", "kcal_serv"]
-            },
-            "fat": {
-                "type": "object",
-                "properties": {
-                    "g_100": {"type": "number"},
-                    "g_serv": {"type": ["number", "null"]},
-                    "saturates_g_100": {"type": ["number", "null"]},
-                    "saturates_g_serv": {"type": ["number", "null"]}
-                },
-                "required": ["g_100", "g_serv", "saturates_g_100", "saturates_g_serv"]
-            },
-            "carbohydrate": {
-                "type": "object",
-                "properties": {
-                    "g_100": {"type": "number"},
-                    "g_serv": {"type": ["number", "null"]},
-                    "sugars_g_100": {"type": ["number", "null"]},
-                    "sugars_g_serv": {"type": ["number", "null"]}
-                },
-                "required": ["g_100", "g_serv", "sugars_g_100", "sugars_g_serv"]
-            },
-            "fibre": {
-                "type": "object",
-                "properties": {
-                    "g_100": {"type": ["number", "null"]},
-                    "g_serv": {"type": ["number", "null"]}
-                },
-                "required": ["g_100", "g_serv"]
-            },
-            "protein": {
-                "type": "object",
-                "properties": {
-                    "g_100": {"type": "number"},
-                    "g_serv": {"type": ["number", "null"]}
-                },
-                "required": ["g_100", "g_serv"]
-            },
-            "salt": {
-                "type": "object",
-                "properties": {
-                    "g_100": {"type": ["number", "null"]},
-                    "g_serv": {"type": ["number", "null"]},
-                    "sodium_g_100": {"type": ["number", "null"]},
-                    "sodium_g_serv": {"type": ["number", "null"]}
-                },
-                "required": ["g_100", "g_serv", "sodium_g_100", "sodium_g_serv"]
-            },
-            "ri_percent": {
-                "type": "object",
-                "properties": {
-                    "kcal_serv": {"type": ["number", "null"]},
-                    "fat": {"type": ["number", "null"]},
-                    "saturates": {"type": ["number", "null"]},
-                    "carb": {"type": ["number", "null"]},
-                    "sugars": {"type": ["number", "null"]},
-                    "protein": {"type": ["number", "null"]},
-                    "salt": {"type": ["number", "null"]}
-                },
-                "required": ["kcal_serv", "fat", "saturates", "carb", "sugars", "protein", "salt"]
-            },
-            "notes": {"type": "array", "items": {"type": "string"}},
-            "model_confidence": {"type": "number"},
-            "source_image": {"type": "string"}
-        },
-        "required": [
-            "product_id", "panel_detected", "basis", "energy", "fat",
-            "carbohydrate", "protein", "salt", "ri_percent", "notes",
-            "model_confidence", "source_image"
-        ],
-        "additionalProperties": False
-    },
-    "strict": True
-}
-
-# Tool (function) definition for strict structured output
-NUTRITION_TOOL = [{
-    "type": "function",
-    "name": "NutritionPanel",
-    "description": "Extract nutrition panel values as strict JSON.",
-    "parameters": SCHEMA["schema"]   # reuse your existing JSON Schema object
-}]
-
-SYSTEM_PROMPT = (
-    "You are an expert at reading EU/UK nutrition labels.\n"
-    "- Read the nutrition information panel (NIP) from the image.\n"
-    "- Report per 100g/ml and per serving if present.\n"
-    "- Return only JSON conforming to the function schema. Numbers only, no units in fields.\n"
-    "- If sodium is present, include sodium; if salt is shown, include salt as well.\n"
-)
-
 # ============== HELPERS ==============
 def infer_product_id(filename: str) -> str:
     stem = filename.rsplit("/", 1)[-1]
@@ -166,11 +50,28 @@ def infer_product_id(filename: str) -> str:
     return stem or "unknown"
 
 def to_data_url(file_bytes: bytes, filename: str) -> str:
+    """
+    Convert image bytes to a base64 data URL so we can send it inline to the Responses API.
+    """
     mime = mimetypes.guess_type(filename)[0] or "image/jpeg"
     b64 = base64.b64encode(file_bytes).decode("utf-8")
     return f"data:{mime};base64,{b64}"
 
-def extract_from_image_bytes(
+INSTRUCTION = (
+    "Extract all nutrition and related values you can read from this label into a single JSON object.\n"
+    "- Include per-100g/ml and per-serving if present.\n"
+    "- Use numbers for numeric fields (no units inside numbers).\n"
+    "- If an item is not printed on the label, omit it (do not guess).\n"
+    "- Include a top-level 'product_id' with the provided value.\n"
+    "- Examples of useful keys (use only if they appear): energy_kJ_100, energy_kcal_100, energy_kJ_serv, energy_kcal_serv, "
+    "fat_g_100, saturates_g_100, fat_g_serv, saturates_g_serv, carbohydrate_g_100, sugars_g_100, carbohydrate_g_serv, sugars_g_serv, "
+    "fibre_g_100, fibre_g_serv, protein_g_100, protein_g_serv, salt_g_100, salt_g_serv, sodium_g_100, sodium_g_serv, "
+    "alcohol_g_100, alcohol_g_serv, vitamins:{...}, minerals:{...}, amino_acids:[...], probiotics:[...], botanicals:[...], "
+    "other_nutrients:[...], ingredients_text, allergens_present, may_contain, sweeteners_present.\n"
+    "- Return JSON only, no prose."
+)
+
+def extract_from_image_bytes_noschema(
     client: OpenAI,
     model_name: str,
     img_bytes: bytes,
@@ -178,14 +79,21 @@ def extract_from_image_bytes(
     product_id: str
 ) -> Dict[str, Any]:
     """
-    Extract nutrition data from an image using the Responses API and tool/function calling.
-
-    Prereqs in your module:
-      - SCHEMA: the JSON Schema dict (with keys "name", "schema", "strict")
-      - NUTRITION_TOOL: [{"type":"function","name":"NutritionPanel","description":"...","parameters": SCHEMA["schema"]}]
-      - SYSTEM_PROMPT: instruction string for the model
-      - to_data_url(bytes, filename): returns a base64 data URL string for the image
+    Responses API (no explicit schema): request valid JSON via response_format={"type":"json_object"}.
+    Image is sent inline as a base64 data URL. Returns a Python dict.
     """
+    # Normalize orientation; keep size as-is (you can resize if you want to limit payload)
+    try:
+        img = Image.open(io.BytesIO(img_bytes))
+        img = ImageOps.exif_transpose(img)
+        buf = io.BytesIO()
+        # Save as JPEG to keep payload efficient even if user uploaded PNG
+        img.convert("RGB").save(buf, format="JPEG", quality=90, optimize=True)
+        img_bytes = buf.getvalue()
+    except Exception:
+        # If Pillow fails, fall back to original bytes
+        pass
+
     data_url = to_data_url(img_bytes, filename)
 
     resp = client.responses.create(
@@ -194,111 +102,39 @@ def extract_from_image_bytes(
             "role": "user",
             "content": [
                 {"type": "input_text",
-                 "text": SYSTEM_PROMPT + f"Product ID: {product_id}"},
+                 "text": INSTRUCTION + f"\nproduct_id to include: {product_id}"},
                 {"type": "input_image",
                  "image_url": data_url}
             ]
         }],
-        tools=NUTRITION_TOOL,
-        # Force a single function/tool call so we always get structured JSON back
-        tool_choice={"type": "function", "name": "NutritionPanel"},
+        response_format={"type": "json_object"},
         temperature=0
     )
 
-    # ---- Parse tool call arguments (strict JSON per your schema) ----
-    # 1) Typed-object path (preferred)
+    # The SDK exposes a convenience: output_text (single string)
+    txt = getattr(resp, "output_text", "") or ""
+    if not txt:
+        # Fallback to raw output traversal if needed
+        raw = getattr(resp, "model_dump", lambda: {})() or {}
+        txt = raw.get("output_text", "{}") or "{}"
+
     try:
-        for item in getattr(resp, "output", []) or []:
-            for c in getattr(item, "content", []) or []:
-                if getattr(c, "type", "") in ("tool_call", "function_call"):
-                    tc = getattr(c, "tool_call", None)
-                    if tc is not None:
-                        # Different SDK builds expose either .function.arguments or .arguments
-                        func = getattr(tc, "function", None)
-                        args = (
-                            getattr(func, "arguments", None)
-                            if func is not None else None
-                        ) or getattr(tc, "arguments", None)
-                        if args:
-                            return json.loads(args)
+        data = json.loads(txt)
     except Exception:
-        pass
+        # As a last resort, wrap raw text
+        data = {"product_id": product_id, "raw": txt}
 
-    # 2) Raw-dict path (fallback)
-    raw = {}
-    if hasattr(resp, "model_dump"):
-        try:
-            raw = resp.model_dump() or {}
-        except Exception:
-            raw = {}
-    if not raw and hasattr(resp, "json"):
-        try:
-            raw = json.loads(resp.json())
-        except Exception:
-            raw = {}
+    # Ensure product_id present
+    data.setdefault("product_id", product_id)
+    return data
 
-    outputs = raw.get("output", [])
-    for item in outputs or []:
-        for c in item.get("content", []) or []:
-            if c.get("type") in ("tool_call", "function_call"):
-                tc = c.get("tool_call", {}) or {}
-                args = (tc.get("function", {}) or {}).get("arguments") or tc.get("arguments")
-                if args:
-                    return json.loads(args)
-
-    # 3) Last resort (shouldn’t trigger with tool_choice forced)
-    text = getattr(resp, "output_text", "") or raw.get("output_text", "") or "{}"
-    return json.loads(text)
-
-
-def as_human_text(p: Dict[str, Any]) -> str:
-    b = p.get("basis", {})
-    e = p.get("energy", {})
-    fat = p.get("fat", {})
-    carb = p.get("carbohydrate", {})
-    fib = p.get("fibre", {})
-    pro = p.get("protein", {})
-    salt = p.get("salt", {})
-    rp = p.get("ri_percent", {})
-
-    lines = [
-        f"Product_ID: {p.get('product_id','')}",
-        f"Panel_Detected: {p.get('panel_detected', False)}",
-        f"Basis: per_100g={b.get('per_100g')}, per_serving={b.get('per_serving')}, serving_size={b.get('serving_size')}",
-        (
-            "Per_100g: "
-            f"Energy {e.get('kJ_100')} kJ / {e.get('kcal_100')} kcal; "
-            f"Fat {fat.get('g_100')} g (sat {fat.get('saturates_g_100')} g); "
-            f"Carb {carb.get('g_100')} g (sugars {carb.get('sugars_g_100')} g); "
-            f"Fibre {fib.get('g_100')}; Protein {pro.get('g_100')} g; Salt {salt.get('g_100')} g"
-        ),
-    ]
-
-    if (e.get("kcal_serv") is not None) or (fat.get("g_serv") is not None) or (carb.get("g_serv") is not None) or (pro.get("g_serv") is not None) or (salt.get("g_serv") is not None):
-        lines.append(
-            "Per_Serving: "
-            f"Energy {e.get('kJ_serv')} kJ / {e.get('kcal_serv')} kcal; "
-            f"Fat {fat.get('g_serv')} g (sat {fat.get('saturates_g_serv')} g); "
-            f"Carb {carb.get('g_serv')} g (sugars {carb.get('sugars_g_serv')} g); "
-            f"Fibre {fib.get('g_serv')}; Protein {pro.get('g_serv')} g; Salt {salt.get('g_serv')} g"
-        )
-
-    if any(v is not None for v in rp.values()) if isinstance(rp, dict) else False:
-        lines.append(
-            "RI_Percent: "
-            f"kcal={rp.get('kcal_serv')}%, fat={rp.get('fat')}%, sat={rp.get('saturates')}%, "
-            f"carb={rp.get('carb')}%, sugars={rp.get('sugars')}%, protein={rp.get('protein')}%, salt={rp.get('salt')}%"
-        )
-
-    if p.get("notes"):
-        lines.append("Notes: " + "; ".join(p["notes"]))
-
-    return "\n".join(lines)
+def pretty_json_block(d: Dict[str, Any]) -> str:
+    return json.dumps(d, ensure_ascii=False, indent=2)
 
 # ============== SIDEBAR SETTINGS ==============
 with st.sidebar:
     st.subheader("Settings")
-    model = st.selectbox("Model", options=["gpt-4o"], index=0, help="Vision-capable model for extraction.")
+    model = st.selectbox("Model", options=["gpt-4o"], index=0, help="Vision-capable model.")
     max_items = st.number_input("Max images to process", min_value=1, max_value=500, value=500, step=1)
 
 # ============== MAIN UI ==============
@@ -310,7 +146,7 @@ uploads = st.file_uploader(
 )
 
 if uploads:
-    st.write(f"Selected **{len(uploads)}** file(s). Filenames will be used as Product IDs.")
+    st.write(f"Selected **{len(uploads)}** file(s). Filenames will be used as product IDs.")
 
 run = st.button("Extract nutrition values", type="primary", use_container_width=True)
 
@@ -327,11 +163,11 @@ if run:
         product_id = infer_product_id(filename)
         try:
             img_bytes = up.read()
-            payload = extract_from_image_bytes(client, model, img_bytes, filename, product_id)
-            payload["source_image"] = filename
-            outputs.append(as_human_text(payload) + "\n---\n")
+            payload = extract_from_image_bytes_noschema(client, model, img_bytes, filename, product_id)
+            block = pretty_json_block(payload)
+            outputs.append(block + "\n---\n")
         except Exception as e:
-            outputs.append(f"Product_ID: {product_id}\nERROR: {e}\n---\n")
+            outputs.append(pretty_json_block({"product_id": product_id, "error": str(e)}) + "\n---\n")
         finally:
             progress.progress(idx / max(1, total), text=f"Processed {idx} / {total}")
             time.sleep(0.05)
@@ -348,4 +184,4 @@ if run:
         use_container_width=True,
     )
 
-    st.caption("Tip: keep images sharp and square-on for best results.")
+    st.caption("Tip: Use clear, sharp, square-on photos to improve extraction quality.")
