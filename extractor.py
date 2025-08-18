@@ -175,6 +175,14 @@ INSTRUCTION = (
     "- Return JSON only (no prose, no markdown)."
 )
 
+DEBUG_INSTRUCTION = (
+    "- Additionally include a top-level 'debug' object with:\n"
+    "  • 'summary': up to 5 very short bullet points summarising what you extracted;\n"
+    "  • 'uncertain_fields': array of keys where the value may be unreliable;\n"
+    "  • 'source_text': a short string (≤400 chars) copying the most relevant lines read from the label;\n"
+    "  • 'warnings': array of short strings for any visibility/OCR issues.\n"
+    "- Do not include chain-of-thought, internal reasoning, or step-by-step solutions."
+)
 
 
 def extract_from_image_bytes_freeform(
