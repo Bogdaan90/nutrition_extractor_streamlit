@@ -1,20 +1,3 @@
-"""
-Nutrition Extractor (Image → JSON)
-- Freeform Responses API (no tools, no response_format, no schema)
-- Uses OPENAI_API_KEY from the environment if present (works with your launcher),
-  otherwise lets you enter the key in the Streamlit sidebar.
-- Optional debug block in the JSON (summary/uncertainties/source excerpt; no chain-of-thought)
-- Estimates run cost (pre-run) and shows actual token usage (post-run)
-- Sends each image inline as a base64 data URL (no Files API, no hosting)
-- Saves outputs as:
-    • TXT: pretty-printed JSON per image (no units)
-    • CSV: flattened JSON rows (numeric values only; no *_unit columns)
-
-Run:
-  pip install --upgrade streamlit openai pillow
-  streamlit run nutrition_extractor_streamlit.py
-"""
-
 from __future__ import annotations
 import io
 import json
@@ -23,9 +6,9 @@ import base64
 import mimetypes
 import math
 import csv
+import re
 from typing import Dict, Any, List, Tuple
 
-import os
 import streamlit as st
 from PIL import Image, ImageOps
 from openai import OpenAI
@@ -33,29 +16,24 @@ from openai import OpenAI
 # ==================== PAGE SETUP ====================
 st.set_page_config(page_title="Nutrition Extractor (Image → JSON)", layout="centered")
 st.title("Nutrition Extractor (Image → JSON)")
-st.caption("Upload nutrition labels, get JSON back — freeform, no units; debug + cost estimator included.")
+st.caption("Upload nutrition labels, get JSON back — freeform, with units, debug, cost estimate, and CSV export.")
 
-# ==================== AUTH ====================
-# Prefer env var (works with your launcher). If missing, show sidebar input.
-env_key = os.environ.get("OPENAI_API_KEY", "").strip()
+# ==================== AUTH IN UI ====================
 if "api_key" not in st.session_state:
-    st.session_state["api_key"] = "" if env_key == "" else env_key
+    st.session_state["api_key"] = ""
 
 with st.sidebar:
     st.subheader("Authentication")
-    if not env_key:
-        st.session_state["api_key"] = st.text_input(
-            "OpenAI API key",
-            type="password",
-            placeholder="sk-...",
-            help="Stored only in this session; not written to disk."
-        )
-    else:
-        st.success("Using OPENAI_API_KEY from environment (launcher).")
+    st.session_state["api_key"] = st.text_input(
+        "OpenAI API key",
+        type="password",
+        placeholder="sk-...",
+        help="Stored only in this session; not written to disk."
+    )
 
 api_key = st.session_state["api_key"]
 if not api_key:
-    st.info("Provide an API key (via launcher or sidebar) to enable extraction.")
+    st.info("Enter your OpenAI API key in the sidebar to enable extraction.")
     st.stop()
 
 client = OpenAI(api_key=api_key)
@@ -129,13 +107,15 @@ def robust_json_from_text(txt: str, product_id: str) -> Dict[str, Any]:
     # Last resort: wrap raw text
     return {"product_id": product_id, "raw": txt.strip()}
 
-# ==================== INSTRUCTIONS (no units) ====================
+# ==================== INSTRUCTIONS ====================
 INSTRUCTION = (
     "Extract all nutrition and related values you can read from this label into a single JSON object.\n"
     "- Include per-100g/ml and per-serving if present.\n"
     "- Use numbers for numeric fields (no units inside numbers).\n"
     "- If an item is not printed on the label, omit it (do not guess).\n"
     "- Include a top-level 'product_id' with the provided value.\n"
+    "- ALSO include a top-level 'units' object mapping each numeric key you return to its unit string "
+    "(e.g., 'energy_kJ_100'→'kJ', 'fat_g_serv'→'g/serving', 'vitamin_C_mg_100'→'mg/100g' as appropriate).\n"
     "- Return JSON only (no prose, no markdown)."
 )
 
@@ -148,6 +128,109 @@ DEBUG_INSTRUCTION = (
     "  • 'warnings': array of short strings for any visibility/OCR issues.\n"
     "- Do not include chain-of-thought, internal reasoning, or step-by-step solutions."
 )
+
+# ==================== UNITS SUPPORT ====================
+def infer_unit_from_key(key: str) -> str | None:
+    """Best-effort unit guess when the model didn't return a units map."""
+    k = key.lower()
+
+    # Energy
+    if "energy_kj" in k or k.endswith("_kj_100") or k.endswith("_kj_serv"):
+        return "kJ" if "_serv" not in k else "kJ/serving"
+    if "energy_kcal" in k or k.endswith("_kcal_100") or k.endswith("_kcal_serv"):
+        return "kcal" if "_serv" not in k else "kcal/serving"
+
+    # Percent/RI
+    if "ri" in k or k.endswith("_percent") or k.endswith("_pct"):
+        return "%"
+
+    # Mass units with basis in key: *_g_100, *_mg_serv, *_mcg_100, *_ug_serv, etc.
+    m = re.search(r"_(g|mg|mcg|µg|ug)_(100|serv|ml|portion)$", k)
+    if m:
+        unit, basis = m.groups()
+        if unit == "ug": unit = "µg"
+        if unit == "mcg": unit = "µg"
+        if basis == "100":   return f"{unit}/100g"
+        if basis == "ml":    return f"{unit}/100ml"
+        if basis in ("serv", "portion"): return f"{unit}/serving"
+
+    # Simple suffixes with no basis
+    if k.endswith("_g"):   return "g"
+    if k.endswith("_mg"):  return "mg"
+    if k.endswith("_mcg") or k.endswith("_µg") or k.endswith("_ug"): return "µg"
+
+    # Probiotics
+    if "cfu" in k: return "CFU"
+
+    return None
+
+def flatten_record(d: Dict[str, Any], parent: str = "", sep: str = ".") -> Dict[str, Any]:
+    """Flatten nested dicts with dotted keys; lists -> JSON strings."""
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        key = f"{parent}{sep}{k}" if parent else k
+        if isinstance(v, dict):
+            out.update(flatten_record(v, key, sep=sep))
+        elif isinstance(v, list):
+            out[key] = json.dumps(v, ensure_ascii=False)
+        else:
+            out[key] = v
+    return out
+
+def merge_units_into_flat(flat: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Add <key>_unit columns to a flattened record.
+    Priority 1: payload['units'][key]
+    Priority 2: infer from key name
+    """
+    out = dict(flat)
+    units_map = payload.get("units")
+    units_map = units_map if isinstance(units_map, dict) else {}
+
+    for k in list(flat.keys()):
+        unit_col = f"{k}_unit"
+        if unit_col in out:
+            continue
+        # model-supplied unit
+        u = units_map.get(k)
+        if isinstance(u, str) and u.strip():
+            out[unit_col] = u.strip()
+            continue
+        # inference fallback
+        inferred = infer_unit_from_key(k)
+        if inferred:
+            out[unit_col] = inferred
+    return out
+
+def add_display_columns(flat: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create <key>_display columns like '4 g' using <key> and <key>_unit.
+    Leaves original numeric and *_unit columns intact.
+    """
+    out = dict(flat)
+    for k, v in flat.items():
+        if k.endswith("_unit"):  # skip unit columns
+            continue
+        unit = flat.get(f"{k}_unit")
+        if unit and v not in (None, "") and isinstance(v, (int, float, str)):
+            out[f"{k}_display"] = f"{v} {unit}".strip()
+    return out
+
+def payload_with_inline_units(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    For preview only: replace top-level numeric values with "value unit" strings when a unit is known.
+    Keeps the original 'units' map and everything else intact.
+    """
+    units_map = payload.get("units") if isinstance(payload.get("units"), dict) else {}
+    result = dict(payload)
+    for k, v in list(payload.items()):
+        if k in ("units", "debug"):
+            continue
+        if isinstance(v, (int, float)):
+            unit = units_map.get(k) or infer_unit_from_key(k)
+            if unit:
+                result[k] = f"{v} {unit}"
+    return result
 
 # ==================== DEBUG FALLBACK ====================
 def ensure_debug_block(payload: dict, image_name: str) -> dict:
@@ -258,19 +341,6 @@ def extract_from_image_bytes_freeform(
 def pretty_json_block(d: Dict[str, Any]) -> str:
     return json.dumps(d, ensure_ascii=False, indent=2)
 
-def flatten_record(d: Dict[str, Any], parent: str = "", sep: str = ".") -> Dict[str, Any]:
-    """Flatten nested dicts with dotted keys; lists -> JSON strings."""
-    out: Dict[str, Any] = {}
-    for k, v in d.items():
-        key = f"{parent}{sep}{k}" if parent else k
-        if isinstance(v, dict):
-            out.update(flatten_record(v, key, sep=sep))
-        elif isinstance(v, list):
-            out[key] = json.dumps(v, ensure_ascii=False)
-        else:
-            out[key] = v
-    return out
-
 # ==================== SIDEBAR SETTINGS ====================
 with st.sidebar:
     st.subheader("Settings")
@@ -282,6 +352,21 @@ with st.sidebar:
         "Include debug info (summary, uncertain fields, source text)",
         value=False,
         help="Adds a compact 'debug' object to the JSON. No chain-of-thought is shown."
+    )
+
+    # Inline units toggle (affects TXT preview only)
+    inline_units = st.checkbox(
+        "Inline units in preview (JSON)",
+        value=True,
+        help="Shows 'value unit' in the TXT preview JSON. CSV settings are below."
+    )
+
+    # CSV value format switch
+    csv_value_format = st.radio(
+        "CSV value format",
+        ["Numeric + *_unit + *_display (default)", "Replace numeric columns with 'value unit'"],
+        index=0,
+        help="If you pick replace, numeric columns become strings like '4 g'."
     )
 
     st.markdown("---")
@@ -372,15 +457,17 @@ if run:
             if show_debug:
                 payload = ensure_debug_block(payload, filename)
 
-            # Save payload and flattened version (drop units if present)
+            # Save payload and flattened versions
             payloads.append(payload)
-            payload_for_csv = dict(payload)
-            payload_for_csv.pop("units", None)   # ensure CSV has values only
-            flat = flatten_record(payload_for_csv)
+            flat = flatten_record(payload)
+            flat = merge_units_into_flat(flat, payload)
+            # Always compute display columns so CSV can use them
+            flat = add_display_columns(flat)
             flat_payloads.append(flat)
 
-            # TXT preview shows the raw JSON (no units requested)
-            block = pretty_json_block(payload)
+            # TXT preview: optionally inline units in the JSON view
+            preview_obj = payload_with_inline_units(payload) if inline_units else payload
+            block = pretty_json_block(preview_obj)
             outputs.append(block + "\n---\n")
         except Exception as e:
             err = {"product_id": product_id, "error": str(e)}
@@ -404,7 +491,7 @@ if run:
         use_container_width=True,
     )
 
-    # ---- CSV download (numbers only; no unit columns) ----
+    # ---- CSV download ----
     # Union of all CSV columns
     fieldnames: List[str] = []
     seen = set()
@@ -419,6 +506,12 @@ if run:
     writer.writeheader()
     for rec in flat_payloads:
         row = {k: rec.get(k, "") for k in fieldnames}
+        # If user chose "Replace", override main columns with their *_display when available
+        if csv_value_format.startswith("Replace"):
+            for k in list(row.keys()):
+                disp = rec.get(f"{k}_display")
+                if disp:
+                    row[k] = disp
         writer.writerow(row)
 
     st.download_button(
