@@ -6,6 +6,7 @@ import base64
 import mimetypes
 import math
 import csv
+import re
 from typing import Dict, Any, List, Tuple
 
 import streamlit as st
@@ -15,7 +16,7 @@ from openai import OpenAI
 # ==================== PAGE SETUP ====================
 st.set_page_config(page_title="Nutrition Extractor (Image → JSON)", layout="centered")
 st.title("Nutrition Extractor (Image → JSON)")
-st.caption("Upload nutrition labels, get JSON back — freeform. Includes cost estimate and CSV export.")
+st.caption("Upload nutrition labels, get JSON back — freeform, with units, debug, cost estimate, and CSV export.")
 
 # ==================== AUTH IN UI ====================
 if "api_key" not in st.session_state:
@@ -45,14 +46,12 @@ except Exception:
     pass
 
 # ==================== COST ESTIMATION HELPERS ====================
-
 def estimate_image_tokens(width: int, height: int, tile: int = 512, base: int = 70, per_tile: int = 140) -> int:
-    """Estimate visual tokens for an image based on tiling.
-    tiles = ceil(W/512) * ceil(H/512); tokens = base + per_tile * tiles
+    """Estimate visual tokens for an image based on tiling:
+       tiles = ceil(W/512) * ceil(H/512); tokens = base + per_tile * tiles
     """
     tiles = math.ceil(width / tile) * math.ceil(height / tile)
     return base + per_tile * tiles
-
 
 def estimate_cost_for_image(width: int, height: int,
                             text_tokens: int,
@@ -68,46 +67,115 @@ def estimate_cost_for_image(width: int, height: int,
     cost = (in_tok / 1e6) * float(input_price_per_m) + (int(out_tokens) / 1e6) * float(output_price_per_m)
     return in_tok, cost
 
-
 def human_usd(x: float) -> str:
     return f"$ {x:,.2f}"
 
-# ==================== EXTRACTION HELPERS ====================
-
+# ==================== GENERAL HELPERS ====================
 def infer_product_id(filename: str) -> str:
     stem = filename.rsplit("/", 1)[-1]
     stem = stem.rsplit(".", 1)[0]
     return stem or "unknown"
-	
+
+def to_data_url(file_bytes: bytes, filename: str) -> str:
+    """Convert image bytes to a base64 data URL to send inline to the Responses API."""
+    mime = mimetypes.guess_type(filename)[0] or "image/jpeg"
+    b64 = base64.b64encode(file_bytes).decode("utf-8")
+    return f"data:{mime};base64,{b64}"
+
+def robust_json_from_text(txt: str, product_id: str) -> Dict[str, Any]:
+    """Parse JSON even if the model returns extra text around it."""
+    # Fast path
+    try:
+        data = json.loads(txt)
+        if isinstance(data, dict):
+            data.setdefault("product_id", product_id)
+            return data
+    except Exception:
+        pass
+    # Try to extract the largest {...} block
+    start = txt.find("{")
+    end = txt.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        snippet = txt[start:end+1]
+        try:
+            data = json.loads(snippet)
+            if isinstance(data, dict):
+                data.setdefault("product_id", product_id)
+                return data
+        except Exception:
+            pass
+    # Last resort: wrap raw text
+    return {"product_id": product_id, "raw": txt.strip()}
+
+# ==================== INSTRUCTIONS ====================
+INSTRUCTION = (
+    "Extract all nutrition and related values you can read from this label into a single JSON object.\n"
+    "- Include per-100g/ml and per-serving if present.\n"
+    "- Use numbers for numeric fields (no units inside numbers).\n"
+    "- If an item is not printed on the label, omit it (do not guess).\n"
+    "- Include a top-level 'product_id' with the provided value.\n"
+    "- ALSO include a top-level 'units' object mapping each numeric key you return to its unit string "
+    "(e.g., 'energy_kJ_100'→'kJ', 'fat_g_serv'→'g/serving', 'vitamin_C_mg_100'→'mg/100g' as appropriate).\n"
+    "- Return JSON only (no prose, no markdown)."
+)
+
+# Optional debug addendum — NOT chain-of-thought; high-level summaries only
+DEBUG_INSTRUCTION = (
+    "- Additionally include a top-level 'debug' object with:\n"
+    "  • 'summary': up to 5 very short bullet points summarising what you extracted;\n"
+    "  • 'uncertain_fields': array of keys where the value may be unreliable;\n"
+    "  • 'source_text': a short string (≤400 chars) copying the most relevant lines read from the label;\n"
+    "  • 'warnings': array of short strings for any visibility/OCR issues.\n"
+    "- Do not include chain-of-thought, internal reasoning, or step-by-step solutions."
+)
+
+# ==================== UNITS SUPPORT ====================
 def infer_unit_from_key(key: str) -> str | None:
     """Best-effort unit guess when the model didn't return a units map."""
     k = key.lower()
-    # energy
-    if "kj" in k: return "kJ"
-    if "kcal" in k: return "kcal"
-    # percent/RI
-    if "ri" in k or k.endswith("_percent") or k.endswith("_pct"): return "%"
-    # grams / milligrams / micrograms
-    # Look for common suffix patterns: *_g_100, *_g_serv, *_mg_100, *_ug_serv, etc.
-    import re
-    m = re.search(r"_(g|mg|µg|ug)_(100|serv|ml|portion)$", k)
+
+    # Energy
+    if "energy_kj" in k or k.endswith("_kj_100") or k.endswith("_kj_serv"):
+        return "kJ" if "_serv" not in k else "kJ/serving"
+    if "energy_kcal" in k or k.endswith("_kcal_100") or k.endswith("_kcal_serv"):
+        return "kcal" if "_serv" not in k else "kcal/serving"
+
+    # Percent/RI
+    if "ri" in k or k.endswith("_percent") or k.endswith("_pct"):
+        return "%"
+
+    # Mass units with basis in key: *_g_100, *_mg_serv, *_mcg_100, *_ug_serv, etc.
+    m = re.search(r"_(g|mg|mcg|µg|ug)_(100|serv|ml|portion)$", k)
     if m:
         unit, basis = m.groups()
-        unit = "µg" if unit == "ug" else unit
-        if basis == "100": 
-            return f"{unit}/100g"
-        if basis in ("serv", "portion"):
-            return f"{unit}/serving"
-        if basis == "ml":
-            return f"{unit}/100ml"
-    # Simple “_g” or “_mg” without basis
-    if k.endswith("_g"): return "g"
-    if k.endswith("_mg"): return "mg"
-    if k.endswith("_ug") or k.endswith("_µg"): return "µg"
-    # probiotics commonly as CFU
+        if unit == "ug": unit = "µg"
+        if unit == "mcg": unit = "µg"
+        if basis == "100":   return f"{unit}/100g"
+        if basis == "ml":    return f"{unit}/100ml"
+        if basis in ("serv", "portion"): return f"{unit}/serving"
+
+    # Simple suffixes with no basis
+    if k.endswith("_g"):   return "g"
+    if k.endswith("_mg"):  return "mg"
+    if k.endswith("_mcg") or k.endswith("_µg") or k.endswith("_ug"): return "µg"
+
+    # Probiotics
     if "cfu" in k: return "CFU"
+
     return None
 
+def flatten_record(d: Dict[str, Any], parent: str = "", sep: str = ".") -> Dict[str, Any]:
+    """Flatten nested dicts with dotted keys; lists -> JSON strings."""
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        key = f"{parent}{sep}{k}" if parent else k
+        if isinstance(v, dict):
+            out.update(flatten_record(v, key, sep=sep))
+        elif isinstance(v, list):
+            out[key] = json.dumps(v, ensure_ascii=False)
+        else:
+            out[key] = v
+    return out
 
 def merge_units_into_flat(flat: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
     """
@@ -120,83 +188,34 @@ def merge_units_into_flat(flat: Dict[str, Any], payload: Dict[str, Any]) -> Dict
     units_map = units_map if isinstance(units_map, dict) else {}
 
     for k in list(flat.keys()):
-        # If key already has a unit column, skip
         unit_col = f"{k}_unit"
         if unit_col in out:
             continue
-        # 1) model-supplied units
-        if k in units_map and isinstance(units_map[k], str) and units_map[k].strip():
-            out[unit_col] = units_map[k].strip()
+        # model-supplied unit
+        u = units_map.get(k)
+        if isinstance(u, str) and u.strip():
+            out[unit_col] = u.strip()
             continue
-        # 2) heuristic inference
+        # inference fallback
         inferred = infer_unit_from_key(k)
         if inferred:
             out[unit_col] = inferred
     return out
 
-def to_data_url(file_bytes: bytes, filename: str) -> str:
-    """Convert image bytes to a base64 data URL to send inline to the Responses API."""
-    mime = mimetypes.guess_type(filename)[0] or "image/jpeg"
-    b64 = base64.b64encode(file_bytes).decode("utf-8")
-    return f"data:{mime};base64,{b64}"
-
-
-def robust_json_from_text(txt: str, product_id: str) -> Dict[str, Any]:
-    """Parse JSON even if the model returns extra text around it."""
-    try:
-        data = json.loads(txt)
-        if isinstance(data, dict):
-            data.setdefault("product_id", product_id)
-            return data
-    except Exception:
-        pass
-    start = txt.find("{")
-    end = txt.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        snippet = txt[start:end+1]
-        try:
-            data = json.loads(snippet)
-            if isinstance(data, dict):
-                data.setdefault("product_id", product_id)
-                return data
-        except Exception:
-            pass
-    return {"product_id": product_id, "raw": txt.strip()}
-
-
-INSTRUCTION = (
-    "Extract all nutrition and related values you can read from this label into a single JSON object.\n"
-    "- Include per-100g/ml and per-serving if present.\n"
-    "- Use numbers for numeric fields (no units inside numbers).\n"
-    "- If an item is not printed on the label, omit it (do not guess).\n"
-    "- Include a top-level 'product_id' with the provided value.\n"
-    "- ALSO include a top-level 'units' object mapping each numeric key you return to its unit string "
-    "(e.g., 'energy_kJ_100'→'kJ', 'fat_g_100'→'g', 'sodium_g_serv'→'g', 'Vitamin C.per_serv'→'mg').\n"
-    "- Return JSON only (no prose, no markdown)."
-)
-
-DEBUG_INSTRUCTION = (
-    "- Additionally include a top-level 'debug' object with:\n"
-    "  • 'summary': up to 5 very short bullet points summarising what you extracted;\n"
-    "  • 'uncertain_fields': array of keys where the value may be unreliable;\n"
-    "  • 'source_text': a short string (≤400 chars) copying the most relevant lines read from the label;\n"
-    "  • 'warnings': array of short strings for any visibility/OCR issues.\n"
-    "- Do not include chain-of-thought, internal reasoning, or step-by-step solutions."
-)
-
-
+# ==================== EXTRACTION ====================
 def extract_from_image_bytes_freeform(
     client: OpenAI,
     model_name: str,
     img_bytes: bytes,
     filename: str,
-    product_id: str
+    product_id: str,
+    prompt_text: str
 ) -> Tuple[Dict[str, Any], Tuple[int, int]]:
     """
-    Responses API (no tools, no response_format). Ask for plain JSON in text.
+    Responses API (no tools, no response_format). Ask for a plain JSON object in text.
     Returns: (payload_dict, (input_tokens, output_tokens)) — tokens may be (0,0) if SDK omits usage.
     """
-    # Normalize orientation; re-encode to JPEG
+    # Normalize orientation; re-encode to JPEG to keep payload efficient
     try:
         img = Image.open(io.BytesIO(img_bytes))
         img = ImageOps.exif_transpose(img)
@@ -214,7 +233,7 @@ def extract_from_image_bytes_freeform(
             "role": "user",
             "content": [
                 {"type": "input_text",
-                 "text": INSTRUCTION + f"\nproduct_id to include: {product_id}"},
+                 "text": prompt_text + f"\nproduct_id to include: {product_id}"},
                 {"type": "input_image",
                  "image_url": data_url}
             ]
@@ -240,7 +259,7 @@ def extract_from_image_bytes_freeform(
         except Exception:
             pass
 
-    # Parse text
+    # Prefer convenience property; fall back to raw dict traversal
     txt = getattr(resp, "output_text", "") or ""
     if not txt and hasattr(resp, "model_dump"):
         try:
@@ -259,24 +278,8 @@ def extract_from_image_bytes_freeform(
 
     return robust_json_from_text(txt or "{}", product_id), (in_tok, out_tok)
 
-
 def pretty_json_block(d: Dict[str, Any]) -> str:
     return json.dumps(d, ensure_ascii=False, indent=2)
-
-
-def flatten_record(d: Dict[str, Any], parent: str = "", sep: str = ".") -> Dict[str, Any]:
-    """Flatten nested dicts with dotted keys; lists -> JSON strings."""
-    out: Dict[str, Any] = {}
-    for k, v in d.items():
-        key = f"{parent}{sep}{k}" if parent else k
-        if isinstance(v, dict):
-            out.update(flatten_record(v, key, sep=sep))
-        elif isinstance(v, list):
-            out[key] = json.dumps(v, ensure_ascii=False)
-        else:
-            out[key] = v
-    return out
-
 
 # ==================== SIDEBAR SETTINGS ====================
 with st.sidebar:
@@ -284,7 +287,14 @@ with st.sidebar:
     model = st.selectbox("Model", options=["gpt-4o"], index=0, help="Vision-capable model.")
     max_items = st.number_input("Max images to process", min_value=1, max_value=500, value=500, step=1)
 
-    st.markdown("---")
+    # Debug toggle
+    show_debug = st.checkbox(
+        "Include debug info (summary, uncertain fields, source text)",
+        value=False,
+        help="Adds a compact 'debug' object to the JSON. No chain-of-thought is shown."
+    )
+
+    """st.markdown("---")
     st.subheader("Cost estimator")
     input_price_per_m = st.number_input("Input price per 1M tokens (USD)", value=5.00, min_value=0.0, step=0.10, format="%.2f")
     output_price_per_m = st.number_input("Output price per 1M tokens (USD)", value=20.00, min_value=0.0, step=0.10, format="%.2f")
@@ -294,7 +304,7 @@ with st.sidebar:
     with st.expander("Advanced token model", expanded=False):
         tile = st.number_input("Tile size (px)", value=512, min_value=256, step=64)
         base_tokens = st.number_input("Base tokens per image", value=70, min_value=0, step=10)
-        per_tile_tokens = st.number_input("Tokens per tile", value=140, min_value=0, step=10)
+        per_tile_tokens = st.number_input("Tokens per tile", value=140, min_value=0, step=10)"""
 
 # ==================== MAIN UI ====================
 uploads = st.file_uploader(
@@ -344,6 +354,9 @@ if run:
     if not uploads:
         st.stop()
 
+    # Compose runtime instruction, optionally with debug addendum
+    prompt_text = INSTRUCTION + ('\n' + DEBUG_INSTRUCTION if show_debug else '')
+
     outputs: List[str] = []
     payloads: List[Dict[str, Any]] = []
     flat_payloads: List[Dict[str, Any]] = []
@@ -359,12 +372,16 @@ if run:
         product_id = infer_product_id(filename)
         try:
             img_bytes = up.getvalue()
-            payload, (in_tok, out_tok) = extract_from_image_bytes_freeform(client, model, img_bytes, filename, product_id)
+            payload, (in_tok, out_tok) = extract_from_image_bytes_freeform(
+                client, model, img_bytes, filename, product_id, prompt_text
+            )
             sum_in_tokens += in_tok
             sum_out_tokens += out_tok
 
             payloads.append(payload)
-            flat_payloads.append(flatten_record(payload))
+            flat = flatten_record(payload)
+            flat = merge_units_into_flat(flat, payload)
+            flat_payloads.append(flat)
 
             block = pretty_json_block(payload)
             outputs.append(block + "\n---\n")
@@ -404,7 +421,6 @@ if run:
     writer = csv.DictWriter(csv_buf, fieldnames=fieldnames, extrasaction='ignore')
     writer.writeheader()
     for rec in flat_payloads:
-        # Ensure every field exists; missing -> empty string
         row = {k: rec.get(k, "") for k in fieldnames}
         writer.writerow(row)
 
@@ -419,8 +435,9 @@ if run:
     # ---- Actual cost (if usage was available) ----
     actual_cost = (sum_in_tokens / 1e6) * float(input_price_per_m) + (sum_out_tokens / 1e6) * float(output_price_per_m)
     st.info(
-        f"Actual usage (reported by API where available): input tokens = {sum_in_tokens:,}, output tokens = {sum_out_tokens:,}.\n"
+        f"Actual usage (reported by API where available): input tokens = {sum_in_tokens:,}, "
+        f"output tokens = {sum_out_tokens:,}.\n"
         f"Approximate cost at current rates: {human_usd(actual_cost)}"
     )
 
-    st.caption("Tip: keep images sharp and square-on for best results. Resize to ~1024–1600 px long edge for good accuracy vs cost.")
+    st.caption("Tip: keep images sharp and square-on. Resize to ~1024–1600 px long edge for accuracy vs cost.")
