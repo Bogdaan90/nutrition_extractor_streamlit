@@ -7,9 +7,9 @@ Nutrition Extractor (Image → JSON)
 - Estimates run cost (pre-run) and shows actual token usage (post-run)
 - Sends each image inline as a base64 data URL (no Files API, no hosting)
 - Saves outputs as:
-    • TXT: pretty-printed JSON per image
-    • CSV: flattened JSON rows (numbers only; strips any units.* keys)
-    • CSV (Transposed): rows=fields, columns=products
+    • TXT: pretty-printed JSON per image (preview shows inline units next to values)
+    • CSV: flattened JSON rows where numeric columns are REPLACED with "value unit"
+    • CSV (Transposed): rows=fields, columns=products, also using "value unit"
 
 Run:
   pip install --upgrade streamlit openai pillow
@@ -25,6 +25,7 @@ import mimetypes
 import math
 import csv
 import os
+import re
 from typing import Dict, Any, List, Tuple
 
 import streamlit as st
@@ -34,7 +35,7 @@ from openai import OpenAI
 # ==================== PAGE SETUP ====================
 st.set_page_config(page_title="Nutrition Extractor (Image → JSON)", layout="centered")
 st.title("Nutrition Extractor (Image → JSON)")
-st.caption("Upload nutrition labels, get JSON back — freeform, no units; debug + cost estimator + transposed CSV.")
+st.caption("Upload nutrition labels, get JSON back — inline units, debug, cost estimator, and transposed CSV.")
 
 # ==================== AUTH ====================
 # Prefer env var (works with your launcher). If missing, show sidebar input.
@@ -69,12 +70,14 @@ except Exception:
     pass
 
 # ==================== COST ESTIMATION HELPERS ====================
+
 def estimate_image_tokens(width: int, height: int, tile: int = 512, base: int = 70, per_tile: int = 140) -> int:
     """Estimate visual tokens for an image based on tiling:
        tiles = ceil(W/512) * ceil(H/512); tokens = base + per_tile * tiles
     """
     tiles = math.ceil(width / tile) * math.ceil(height / tile)
     return base + per_tile * tiles
+
 
 def estimate_cost_for_image(width: int, height: int,
                             text_tokens: int,
@@ -90,20 +93,24 @@ def estimate_cost_for_image(width: int, height: int,
     cost = (in_tok / 1e6) * float(input_price_per_m) + (int(out_tokens) / 1e6) * float(output_price_per_m)
     return in_tok, cost
 
+
 def human_usd(x: float) -> str:
     return f"$ {x:,.2f}"
 
 # ==================== GENERAL HELPERS ====================
+
 def infer_product_id(filename: str) -> str:
     stem = filename.rsplit("/", 1)[-1]
     stem = stem.rsplit(".", 1)[0]
     return stem or "unknown"
+
 
 def to_data_url(file_bytes: bytes, filename: str) -> str:
     """Convert image bytes to a base64 data URL to send inline to the Responses API."""
     mime = mimetypes.guess_type(filename)[0] or "image/jpeg"
     b64 = base64.b64encode(file_bytes).decode("utf-8")
     return f"data:{mime};base64,{b64}"
+
 
 def robust_json_from_text(txt: str, product_id: str) -> Dict[str, Any]:
     """Parse JSON even if the model returns extra text around it."""
@@ -130,13 +137,15 @@ def robust_json_from_text(txt: str, product_id: str) -> Dict[str, Any]:
     # Last resort: wrap raw text
     return {"product_id": product_id, "raw": txt.strip()}
 
-# ==================== INSTRUCTIONS (no units) ====================
+# ==================== INSTRUCTIONS (ask for units) ====================
 INSTRUCTION = (
     "Extract all nutrition and related values you can read from this label into a single JSON object.\n"
     "- Include per-100g/ml and per-serving if present.\n"
     "- Use numbers for numeric fields (no units inside numbers).\n"
     "- If an item is not printed on the label, omit it (do not guess).\n"
     "- Include a top-level 'product_id' with the provided value.\n"
+    "- ALSO include a top-level 'units' object mapping each numeric key you return to its unit string \n"
+    "  (e.g., 'energy_kJ_100'→'kJ', 'fat_g_serv'→'g/serving', 'vitamin_C_mg_100'→'mg/100g' as appropriate).\n"
     "- Return JSON only (no prose, no markdown)."
 )
 
@@ -150,20 +159,105 @@ DEBUG_INSTRUCTION = (
     "- Do not include chain-of-thought, internal reasoning, or step-by-step solutions."
 )
 
+# ==================== UNIT SYMBOLS & DISPLAY ====================
+
+def _normalize_unit_symbol(u: str) -> str:
+    """Coerce a model-supplied unit to a compact symbol (strip basis like '/serving')."""
+    if not isinstance(u, str):
+        return ""
+    s = u.strip()
+    # strip common basis
+    s = re.sub(r"/(serv(ing)?|100g|100ml)$", "", s, flags=re.IGNORECASE)
+    # unify microgram spellings
+    if s.lower() in ("ug", "mcg"):
+        return "µg"
+    if s.lower() == "kcal":
+        return "kcal"
+    if s.lower() == "kj":
+        return "kJ"
+    if s.lower() in ("g", "mg", "µg", "%", "cfu"):
+        return s if s != "cfu" else "CFU"
+    return s
+
+
+def infer_unit_symbol_from_key(key: str) -> str | None:
+    k = key.lower()
+    if "kcal" in k: return "kcal"
+    if "kj" in k: return "kJ"
+    if k.endswith("_g") or re.search(r"_g_(100|serv|portion|ml)$", k): return "g"
+    if k.endswith("_mg") or re.search(r"_mg_(100|serv|portion|ml)$", k): return "mg"
+    if any(k.endswith(suf) for suf in ("_mcg", "_µg", "_ug")) or re.search(r"_(mcg|µg|ug)_(100|serv|portion|ml)$", k):
+        return "µg"
+    if k.endswith("_percent") or k.endswith("_pct") or "_ri" in k: return "%"
+    if "cfu" in k: return "CFU"
+    return None
+
+
+def flatten_record(d: Dict[str, Any], parent: str = "", sep: str = ".") -> Dict[str, Any]:
+    """Flatten nested dicts with dotted keys; lists -> JSON strings."""
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        key = f"{parent}{sep}{k}" if parent else k
+        if isinstance(v, dict):
+            out.update(flatten_record(v, key, sep=sep))
+        elif isinstance(v, list):
+            out[key] = json.dumps(v, ensure_ascii=False)
+        else:
+            out[key] = v
+    return out
+
+
+def attach_units_and_display(flat: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Add *_unit and *_display to a flattened row, deriving symbols from payload['units'] or key pattern."""
+    out = dict(flat)
+    units_map = payload.get("units") if isinstance(payload.get("units"), dict) else {}
+    for k, v in list(flat.items()):
+        if k.startswith("units."):
+            # drop explicit units.* keys from flat rows
+            out.pop(k, None)
+            continue
+        if isinstance(v, (int, float)):
+            # prefer model-supplied unit symbol
+            u = units_map.get(k)
+            u = _normalize_unit_symbol(u) if u else None
+            if not u:
+                u = infer_unit_symbol_from_key(k)
+            if u:
+                out[f"{k}_unit"] = u
+                out[f"{k}_display"] = f"{v} {u}"
+    return out
+
+
+def payload_with_inline_units(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """For preview: replace numeric top-level fields with "value unit" strings when a unit is known."""
+    units_map = payload.get("units") if isinstance(payload.get("units"), dict) else {}
+    result = dict(payload)
+    for k, v in list(payload.items()):
+        if k in ("units", "debug"):
+            continue
+        if isinstance(v, (int, float)):
+            u = units_map.get(k)
+            u = _normalize_unit_symbol(u) if u else None
+            if not u:
+                u = infer_unit_symbol_from_key(k)
+            if u:
+                result[k] = f"{v} {u}"
+    return result
+
+
+def _is_unit_col(name: str) -> bool:
+    """Filter out helper columns if needed."""
+    return name.startswith("units.") or name.endswith("_unit") or name.endswith("_display")
+
 # ==================== DEBUG FALLBACK ====================
+
 def ensure_debug_block(payload: dict, image_name: str) -> dict:
-    """
-    Ensure payload contains a 'debug' object. If the model didn't return one,
-    add a compact client-side summary. No chain-of-thought is included.
-    """
     if isinstance(payload.get("debug"), dict):
         return payload
-
     numeric_keys = [k for k, v in payload.items() if isinstance(v, (int, float))]
     vitamins = [k for k in payload if "vitamin" in k.lower()]
     minerals = [k for k in payload if "mineral" in k.lower() or k.lower() in ("zinc_mg_100","zinc_mg_serv","selenium_mcg_100","selenium_mcg_serv")]
     macros = [k for k in payload if any(x in k.lower() for x in ["fat_", "carbohydrate_", "sugars_", "protein_", "salt_", "sodium_"])]
-
     summary = []
     if "energy_kcal_100" in payload: summary.append(f"kcal/100: {payload['energy_kcal_100']}")
     if "energy_kJ_100" in payload: summary.append(f"kJ/100: {payload['energy_kJ_100']}")
@@ -171,7 +265,6 @@ def ensure_debug_block(payload: dict, image_name: str) -> dict:
     if vitamins: summary.append(f"vitamins keys: {len(vitamins)}")
     if minerals: summary.append(f"minerals keys: {len(minerals)}")
     if numeric_keys and len(summary) < 5: summary.append(f"numeric fields: {len(numeric_keys)}")
-
     payload["debug"] = {
         "summary": summary[:5],
         "uncertain_fields": [],
@@ -181,6 +274,7 @@ def ensure_debug_block(payload: dict, image_name: str) -> dict:
     return payload
 
 # ==================== EXTRACTION ====================
+
 def extract_from_image_bytes_freeform(
     client: OpenAI,
     model_name: str,
@@ -256,25 +350,9 @@ def extract_from_image_bytes_freeform(
 
     return robust_json_from_text(txt or "{}", product_id), (in_tok, out_tok)
 
+
 def pretty_json_block(d: Dict[str, Any]) -> str:
     return json.dumps(d, ensure_ascii=False, indent=2)
-
-def flatten_record(d: Dict[str, Any], parent: str = "", sep: str = ".") -> Dict[str, Any]:
-    """Flatten nested dicts with dotted keys; lists -> JSON strings."""
-    out: Dict[str, Any] = {}
-    for k, v in d.items():
-        key = f"{parent}{sep}{k}" if parent else k
-        if isinstance(v, dict):
-            out.update(flatten_record(v, key, sep=sep))
-        elif isinstance(v, list):
-            out[key] = json.dumps(v, ensure_ascii=False)
-        else:
-            out[key] = v
-    return out
-
-def _is_unit_col(name: str) -> bool:
-    """Safety filter: remove unit-related columns if they sneak in."""
-    return name.startswith("units.") or name.endswith("_unit") or name.endswith("_display")
 
 # ==================== SIDEBAR SETTINGS ====================
 with st.sidebar:
@@ -384,14 +462,15 @@ if run:
             if show_debug:
                 payload = ensure_debug_block(payload, filename)
 
-            # Save payload and flattened version for CSV
+            # Save payload and flattened version for CSV, with units + display columns
             payloads.append(payload)
-            payload_for_csv = {k: v for k, v in payload.items() if k != "units"}  # drop nested units map if any
-            flat = flatten_record(payload_for_csv)
+            flat = flatten_record(payload)
+            flat = attach_units_and_display(flat, payload)
             flat_payloads.append(flat)
 
-            # TXT preview shows the raw JSON
-            block = pretty_json_block(payload)
+            # TXT preview: show inline units next to values
+            preview_obj = payload_with_inline_units(payload)
+            block = pretty_json_block(preview_obj)
             outputs.append(block + "\n---\n")
         except Exception as e:
             err = {"product_id": product_id, "error": str(e)}
@@ -415,8 +494,8 @@ if run:
         use_container_width=True,
     )
 
-    # ---- CSV download (numbers only; strips unit-related columns) ----
-    # Union of all CSV columns, filtering out unit-related ones if any sneaked in
+    # ---- CSV download (values replaced with "value unit") ----
+    # Union of CSV columns: exclude helper unit columns; use originals but replace at write-time
     fieldnames: List[str] = []
     seen = set()
     for rec in flat_payloads:
@@ -432,6 +511,11 @@ if run:
     writer.writeheader()
     for rec in flat_payloads:
         row = {k: rec.get(k, "") for k in fieldnames}
+        # Replace numeric columns with their display string when available
+        for k in list(row.keys()):
+            disp = rec.get(f"{k}_display")
+            if disp:
+                row[k] = disp
         writer.writerow(row)
 
     st.download_button(
@@ -457,7 +541,8 @@ if run:
         for field in fieldnames:
             row = [field]
             for rec in flat_payloads:
-                row.append(rec.get(field, ""))
+                disp = rec.get(f"{field}_display")
+                row.append(disp if disp is not None else rec.get(field, ""))
             w.writerow(row)
 
         st.download_button(
@@ -475,3 +560,5 @@ if run:
         f"output tokens = {sum_out_tokens:,}.\n"
         f"Approximate cost at current rates: {human_usd(actual_cost)}"
     )
+
+    st.caption("Tip: keep images sharp and square-on. Resize to ~1024–1600 px long edge for accuracy vs cost.")
