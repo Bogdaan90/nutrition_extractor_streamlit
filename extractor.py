@@ -294,17 +294,17 @@ with st.sidebar:
         help="Adds a compact 'debug' object to the JSON. No chain-of-thought is shown."
     )
 
-    """st.markdown("---")
-    st.subheader("Cost estimator")
-    input_price_per_m = st.number_input("Input price per 1M tokens (USD)", value=5.00, min_value=0.0, step=0.10, format="%.2f")
-    output_price_per_m = st.number_input("Output price per 1M tokens (USD)", value=20.00, min_value=0.0, step=0.10, format="%.2f")
-    text_tokens = st.number_input("Assumed prompt tokens per image", value=200, min_value=0, step=50)
-    out_tokens_assumed = st.number_input("Assumed output tokens per image", value=300, min_value=0, step=50)
+    #st.markdown("---")
+    #st.subheader("Cost estimator")
+    #input_price_per_m = st.number_input("Input price per 1M tokens (USD)", value=5.00, min_value=0.0, step=0.10, format="%.2f")
+    #output_price_per_m = st.number_input("Output price per 1M tokens (USD)", value=20.00, min_value=0.0, step=0.10, format="%.2f")
+    #text_tokens = st.number_input("Assumed prompt tokens per image", value=200, min_value=0, step=50)
+    #out_tokens_assumed = st.number_input("Assumed output tokens per image", value=300, min_value=0, step=50)
 
-    with st.expander("Advanced token model", expanded=False):
-        tile = st.number_input("Tile size (px)", value=512, min_value=256, step=64)
-        base_tokens = st.number_input("Base tokens per image", value=70, min_value=0, step=10)
-        per_tile_tokens = st.number_input("Tokens per tile", value=140, min_value=0, step=10)"""
+    #with st.expander("Advanced token model", expanded=False):
+        #tile = st.number_input("Tile size (px)", value=512, min_value=256, step=64)
+        #base_tokens = st.number_input("Base tokens per image", value=70, min_value=0, step=10)
+        #per_tile_tokens = st.number_input("Tokens per tile", value=140, min_value=0, step=10)
 
 # ==================== MAIN UI ====================
 uploads = st.file_uploader(
