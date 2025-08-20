@@ -202,6 +202,36 @@ def merge_units_into_flat(flat: Dict[str, Any], payload: Dict[str, Any]) -> Dict
             out[unit_col] = inferred
     return out
 
+def add_display_columns(flat: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Create <key>_display columns like '4 g' using <key> and <key>_unit.
+    Leaves original numeric and *_unit columns intact.
+    """
+    out = dict(flat)
+    for k, v in flat.items():
+        if k.endswith("_unit"):  # skip unit columns
+            continue
+        unit = flat.get(f"{k}_unit")
+        if unit and v not in (None, "") and isinstance(v, (int, float, str)):
+            out[f"{k}_display"] = f"{v} {unit}".strip()
+    return out
+
+def payload_with_inline_units(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    For preview only: replace top-level numeric values with "value unit" strings when a unit is known.
+    Keeps the original 'units' map and everything else intact.
+    """
+    units_map = payload.get("units") if isinstance(payload.get("units"), dict) else {}
+    result = dict(payload)
+    for k, v in list(payload.items()):
+        if k in ("units", "debug"):
+            continue
+        if isinstance(v, (int, float)):
+            unit = units_map.get(k) or infer_unit_from_key(k)
+            if unit:
+                result[k] = f"{v} {unit}"
+    return result
+
 # ==================== EXTRACTION ====================
 def extract_from_image_bytes_freeform(
     client: OpenAI,
@@ -294,6 +324,13 @@ with st.sidebar:
         help="Adds a compact 'debug' object to the JSON. No chain-of-thought is shown."
     )
 
+    # NEW: Inline units toggle
+    inline_units = st.checkbox(
+        "Inline units in preview & CSV (_display columns)",
+        value=True,
+        help="Shows 'value unit' in TXT preview and adds *_display columns in CSV."
+    )
+
     st.markdown("---")
     st.subheader("Cost estimator")
     input_price_per_m = st.number_input("Input price per 1M tokens (USD)", value=5.00, min_value=0.0, step=0.10, format="%.2f")
@@ -378,12 +415,27 @@ if run:
             sum_in_tokens += in_tok
             sum_out_tokens += out_tok
 
+            # Guarantee a debug block if requested
+            if show_debug and not isinstance(payload.get("debug"), dict):
+                numeric_keys = [k for k, v in payload.items() if isinstance(v, (int, float))]
+                payload["debug"] = {
+                    "summary": [f"numeric fields: {len(numeric_keys)}"],
+                    "uncertain_fields": [],
+                    "source_text": "",
+                    "warnings": ["debug added client-side; model didn't return 'debug'"]
+                }
+
+            # Save payload and flattened versions
             payloads.append(payload)
             flat = flatten_record(payload)
             flat = merge_units_into_flat(flat, payload)
+            if inline_units:
+                flat = add_display_columns(flat)
             flat_payloads.append(flat)
 
-            block = pretty_json_block(payload)
+            # TXT preview: optionally inline units in the JSON view
+            preview_obj = payload_with_inline_units(payload) if inline_units else payload
+            block = pretty_json_block(preview_obj)
             outputs.append(block + "\n---\n")
         except Exception as e:
             err = {"product_id": product_id, "error": str(e)}
