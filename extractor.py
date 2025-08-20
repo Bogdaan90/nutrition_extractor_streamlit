@@ -232,6 +232,36 @@ def payload_with_inline_units(payload: Dict[str, Any]) -> Dict[str, Any]:
                 result[k] = f"{v} {unit}"
     return result
 
+# ==================== DEBUG FALLBACK ====================
+def ensure_debug_block(payload: dict, image_name: str) -> dict:
+    """
+    Ensure payload contains a 'debug' object. If the model didn't return one,
+    add a compact client-side summary. No chain-of-thought is included.
+    """
+    if isinstance(payload.get("debug"), dict):
+        return payload
+
+    numeric_keys = [k for k, v in payload.items() if isinstance(v, (int, float))]
+    vitamins = [k for k in payload if "vitamin" in k.lower()]
+    minerals = [k for k in payload if "mineral" in k.lower() or k.lower() in ("zinc_mg_100","zinc_mg_serv","selenium_mcg_100","selenium_mcg_serv")]
+    macros = [k for k in payload if any(x in k.lower() for x in ["fat_", "carbohydrate_", "sugars_", "protein_", "salt_", "sodium_"])]
+
+    summary = []
+    if "energy_kcal_100" in payload: summary.append(f"kcal/100: {payload['energy_kcal_100']}")
+    if "energy_kJ_100" in payload: summary.append(f"kJ/100: {payload['energy_kJ_100']}")
+    if macros: summary.append(f"macros keys: {len(macros)}")
+    if vitamins: summary.append(f"vitamins keys: {len(vitamins)}")
+    if minerals: summary.append(f"minerals keys: {len(minerals)}")
+    if numeric_keys and len(summary) < 5: summary.append(f"numeric fields: {len(numeric_keys)}")
+
+    payload["debug"] = {
+        "summary": summary[:5],
+        "uncertain_fields": [],
+        "source_text": "",
+        "warnings": ["debug added client-side; model did not return 'debug' or 'source_text'"]
+    }
+    return payload
+
 # ==================== EXTRACTION ====================
 def extract_from_image_bytes_freeform(
     client: OpenAI,
@@ -324,11 +354,19 @@ with st.sidebar:
         help="Adds a compact 'debug' object to the JSON. No chain-of-thought is shown."
     )
 
-    # NEW: Inline units toggle
+    # Inline units toggle (affects TXT preview only)
     inline_units = st.checkbox(
-        "Inline units in preview & CSV (_display columns)",
+        "Inline units in preview (JSON)",
         value=True,
-        help="Shows 'value unit' in TXT preview and adds *_display columns in CSV."
+        help="Shows 'value unit' in the TXT preview JSON. CSV settings are below."
+    )
+
+    # CSV value format switch
+    csv_value_format = st.radio(
+        "CSV value format",
+        ["Numeric + *_unit + *_display (default)", "Replace numeric columns with 'value unit'"],
+        index=0,
+        help="If you pick replace, numeric columns become strings like '4 g'."
     )
 
     st.markdown("---")
@@ -416,21 +454,15 @@ if run:
             sum_out_tokens += out_tok
 
             # Guarantee a debug block if requested
-            if show_debug and not isinstance(payload.get("debug"), dict):
-                numeric_keys = [k for k, v in payload.items() if isinstance(v, (int, float))]
-                payload["debug"] = {
-                    "summary": [f"numeric fields: {len(numeric_keys)}"],
-                    "uncertain_fields": [],
-                    "source_text": "",
-                    "warnings": ["debug added client-side; model didn't return 'debug'"]
-                }
+            if show_debug:
+                payload = ensure_debug_block(payload, filename)
 
             # Save payload and flattened versions
             payloads.append(payload)
             flat = flatten_record(payload)
             flat = merge_units_into_flat(flat, payload)
-            if inline_units:
-                flat = add_display_columns(flat)
+            # Always compute display columns so CSV can use them
+            flat = add_display_columns(flat)
             flat_payloads.append(flat)
 
             # TXT preview: optionally inline units in the JSON view
@@ -474,6 +506,12 @@ if run:
     writer.writeheader()
     for rec in flat_payloads:
         row = {k: rec.get(k, "") for k in fieldnames}
+        # If user chose "Replace", override main columns with their *_display when available
+        if csv_value_format.startswith("Replace"):
+            for k in list(row.keys()):
+                disp = rec.get(f"{k}_display")
+                if disp:
+                    row[k] = disp
         writer.writerow(row)
 
     st.download_button(
